@@ -1,0 +1,7 @@
+node_modules
+dist
+appointments.db
+appointments.db-journal
+.env
+.git
+README.md
