@@ -1,4 +1,4 @@
-import { Appointment, NewAppointment } from '../types';
+import { Appointment, Barber, NewAppointment } from '../types';
 
 export const appointmentService = {
   async getAll(): Promise<Appointment[]> {
@@ -33,5 +33,27 @@ export const appointmentService = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, value }),
     });
-  }
+  },
+  async getBarbers(): Promise<Barber[]> {
+    const res = await fetch('/api/barbers');
+    return res.json();
+  },
+  async createBarber(barber: Omit<Barber, 'id'>): Promise<{ id: number }> {
+    const res = await fetch('/api/barbers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(barber),
+    });
+    return res.json();
+  },
+  async updateBarber(id: number, updates: Partial<Omit<Barber, 'id'>>): Promise<void> {
+    await fetch(`/api/barbers/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+  },
+  async deleteBarber(id: number): Promise<void> {
+    await fetch(`/api/barbers/${id}`, { method: 'DELETE' });
+  },
 };
