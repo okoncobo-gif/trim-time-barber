@@ -5,83 +5,271 @@
 
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  Calendar, 
-  Clock, 
-  User, 
-  Phone, 
-  Scissors, 
-  ChevronRight, 
-  CheckCircle2, 
-  X, 
+import {
+  Clock,
+  User,
+  Phone,
+  Scissors,
+  ChevronRight,
+  CheckCircle2,
+  X,
   Settings,
   Trash2,
   CalendarDays,
-  Menu,
   Pencil,
   Save,
-  Lock
+  Lock,
+  Ticket,
+  LogOut,
+  KeyRound,
 } from 'lucide-react';
-import { Appointment, Barber, NewAppointment } from './types';
-import { appointmentService } from './services/appointmentService';
+import {
+  Appointment, AppointmentStatus, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser,
+} from './types';
+import { appointmentService, ApiError } from './services/appointmentService';
 
-export default function App() {
-  const [view, setView] = useState<'customer' | 'admin'>('customer');
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
-  const [barbers, setBarbers] = useState<Barber[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [bookingStatus, setBookingStatus] = useState<'idle' | 'submitting' | 'success'>('idle');
-  const [editingAppointment, setEditingAppointment] = useState<Appointment | null>(null);
-  const [editingBarber, setEditingBarber] = useState<Barber | null>(null);
-  const [showAddBarber, setShowAddBarber] = useState(false);
-  const [isEditingHours, setIsEditingHours] = useState(false);
-  const [isUpdatingHours, setIsUpdatingHours] = useState(false);
-  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
-  const [passwordInput, setPasswordInput] = useState('');
-  const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
-  const [settings, setSettings] = useState<Record<string, string>>({
-    opening_hours: 'Tue — Sat, 9:00 AM - 7:00 PM'
-  });
+const TIME_SLOTS = ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00'];
+const slotLabel = (t: string) => {
+  const h = Number(t.slice(0, 2));
+  return `${String(h % 12 || 12).padStart(2, '0')}:${t.slice(3)} ${h < 12 ? 'AM' : 'PM'}`;
+};
+const todayLocal = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+const errorMessage = (e: unknown) => (e instanceof Error ? e.message : 'Something went wrong');
+
+const fieldBase = 'w-full rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all';
+const inputClass = `${fieldBase} px-4 py-3`;
+const labelClass = 'text-xs font-bold uppercase tracking-widest text-black/40';
+const primaryButton = 'w-full bg-black text-white py-4 rounded-xl font-semibold flex items-center justify-center gap-2 hover:bg-black/90 transition-all disabled:opacity-50';
+
+const STATUS_LABEL: Record<AppointmentStatus, string> = {
+  pending: 'Awaiting approval',
+  confirmed: 'Confirmed',
+  cancelled: 'Cancelled',
+};
+
+function StatusBadge({ status }: { status: AppointmentStatus }) {
+  const color = status === 'confirmed' ? 'bg-emerald-100 text-emerald-700'
+    : status === 'cancelled' ? 'bg-red-100 text-red-700'
+    : 'bg-amber-100 text-amber-700';
+  return <span className={`inline-block text-xs font-bold uppercase tracking-widest px-2 py-1 rounded-md ${color}`}>{STATUS_LABEL[status]}</span>;
+}
+
+function Modal({ title, icon, onClose, children, wide }: {
+  title: string; icon?: React.ReactNode; onClose: () => void; children: React.ReactNode; wide?: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 20 }}
+        className={`relative w-full ${wide ? 'max-w-md' : 'max-w-sm'} bg-white rounded-3xl shadow-2xl p-8 max-h-[90vh] overflow-y-auto`}
+      >
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-2">
+            {icon}
+            <h2 className="text-xl font-serif">{title}</h2>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-black/5 rounded-full transition-colors"><X className="w-5 h-5" /></button>
+        </div>
+        {children}
+      </motion.div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ customer: my booking
+
+function MyBooking({ initial, onClose }: { initial: { ref: string; phone: string } | null; onClose: () => void }) {
+  const [ref, setRef] = useState(initial?.ref ?? '');
+  const [phone, setPhone] = useState(initial?.phone ?? '');
+  const [booking, setBooking] = useState<CustomerBooking | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const run = async (fn: () => Promise<CustomerBooking>) => {
+    setBusy(true);
+    setError('');
+    try { setBooking(await fn()); } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); }
+  };
 
   useEffect(() => {
-    fetchAppointments();
-    fetchSettings();
-    fetchBarbers();
+    if (initial) run(() => appointmentService.lookup(initial.ref, initial.phone));
   }, []);
 
-  const fetchBarbers = async () => {
+  const cancel = () => {
+    if (!confirm('Cancel this booking?')) return;
+    run(() => appointmentService.cancelBooking(ref, phone));
+  };
+
+  return (
+    <Modal title="My booking" icon={<Ticket className="w-5 h-5 text-black/40" />} onClose={onClose}>
+      <form onSubmit={e => { e.preventDefault(); run(() => appointmentService.lookup(ref, phone)); }} className="space-y-4">
+        <p className="text-sm text-black/40">Enter the booking code you received and the phone number you booked with.</p>
+        <input required placeholder="Booking code (e.g. 7KQ2MX)" value={ref} onChange={e => setRef(e.target.value)} className={`${inputClass} uppercase`} />
+        <input required type="tel" placeholder="Phone number" value={phone} onChange={e => setPhone(e.target.value)} className={inputClass} />
+        <button type="submit" disabled={busy} className={primaryButton}>{busy ? 'Checking...' : 'Check status'}</button>
+      </form>
+
+      {error && <p className="mt-4 text-sm text-red-600">{error}</p>}
+
+      {booking && (
+        <div className="mt-6 p-4 rounded-xl bg-black/[0.02] border border-black/5 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="font-semibold">{booking.customer_name}</span>
+            <StatusBadge status={booking.status} />
+          </div>
+          <p className="text-sm flex items-center gap-2"><CalendarDays className="w-4 h-4 text-black/40" /> {booking.date} at {slotLabel(booking.time)}</p>
+          <p className="text-sm flex items-center gap-2"><Scissors className="w-4 h-4 text-black/40" /> {booking.barber_name || 'Any available barber'}</p>
+          {booking.status === 'pending' && (
+            <p className="text-sm text-black/50">Your barber hasn't approved this booking yet. Check back here for confirmation.</p>
+          )}
+          {booking.status !== 'cancelled' && (booking.can_cancel ? (
+            <button onClick={cancel} disabled={busy} className="w-full py-3 rounded-xl font-semibold border border-red-200 text-red-600 hover:bg-red-50 transition-all">
+              Cancel booking
+            </button>
+          ) : (
+            <p className="text-xs text-black/40">Online cancellation closes {booking.cancel_cutoff_hours} hours before your appointment. Please call the shop to make changes.</p>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ------------------------------------------------------------------ staff: sign in
+
+function StaffLogin({ barbers, onClose, onSignedIn }: {
+  barbers: Barber[]; onClose: () => void; onSignedIn: (u: SessionUser) => void;
+}) {
+  const [who, setWho] = useState('admin');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
     try {
-      const data = await appointmentService.getBarbers();
-      setBarbers(data);
-    } catch (error) {
-      console.error('Failed to fetch barbers', error);
+      const user = who === 'admin'
+        ? await appointmentService.login('admin', password)
+        : await appointmentService.login('barber', password, Number(who));
+      onSignedIn(user);
+    } catch (err) {
+      setError(errorMessage(err));
     }
+  };
+
+  return (
+    <Modal title="Staff sign in" icon={<Lock className="w-5 h-5 text-black/40" />} onClose={onClose}>
+      <form onSubmit={submit} className="space-y-4">
+        <div className="space-y-2">
+          <label className={labelClass}>Sign in as</label>
+          <select value={who} onChange={e => setWho(e.target.value)} className={`${inputClass} appearance-none`}>
+            <option value="admin">Admin</option>
+            {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+          </select>
+        </div>
+        <input type="password" required autoFocus placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} className={inputClass} />
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        <button type="submit" className={primaryButton}>Sign in</button>
+      </form>
+    </Modal>
+  );
+}
+
+// ------------------------------------------------------------------ app
+
+export default function App() {
+  const [view, setView] = useState<'customer' | 'staff'>('customer');
+  const [user, setUser] = useState<SessionUser | null>(null);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [barbers, setBarbers] = useState<Barber[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [settings, setSettings] = useState<Record<string, string>>({ opening_hours: 'Tue — Sat, 9:00 AM - 7:00 PM', approval_mode: 'manual' });
+
+  // customer
+  const [bookingStatus, setBookingStatus] = useState<'idle' | 'submitting'>('idle');
+  const [bookingError, setBookingError] = useState('');
+  const [lastBooking, setLastBooking] = useState<{ booking: CustomerBooking; phone: string } | null>(null);
+  const [myBooking, setMyBooking] = useState<{ ref: string; phone: string } | null | false>(false); // false = closed
+
+  // staff
+  const [showLogin, setShowLogin] = useState(false);
+  const [editingAppointment, setEditingAppointment] = useState<Appointment | null>(null);
+  const [editingBarber, setEditingBarber] = useState<Barber | null>(null);
+  const [removingBarber, setRemovingBarber] = useState<Barber | null>(null);
+  const [showAddBarber, setShowAddBarber] = useState(false);
+  const [isEditingHours, setIsEditingHours] = useState(false);
+  const [barberFilter, setBarberFilter] = useState('all');
+
+  const isAdmin = user?.role === 'admin';
+
+  useEffect(() => {
+    fetchSettings();
+    fetchBarbers();
+    // Restore a staff session from this browser tab, if any.
+    appointmentService.me().then(setUser).catch(() => appointmentService.logout());
+  }, []);
+
+  useEffect(() => {
+    if (view === 'staff' && user) {
+      fetchAppointments();
+      fetchBarbers();
+    }
+  }, [view, user]);
+
+  const fetchBarbers = async () => {
+    try { setBarbers(await appointmentService.getBarbers()); } catch (e) { console.error('Failed to fetch barbers', e); }
   };
 
   const fetchSettings = async () => {
-    try {
-      const data = await appointmentService.getSettings();
-      setSettings(data);
-    } catch (error) {
-      console.error('Failed to fetch settings', error);
-    }
+    try { setSettings(await appointmentService.getSettings()); } catch (e) { console.error('Failed to fetch settings', e); }
   };
 
   const fetchAppointments = async () => {
-    try {
-      const data = await appointmentService.getAll();
-      setAppointments(data);
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
+    setLoading(true);
+    try { setAppointments(await appointmentService.getAll()); } catch (e) { handleStaffError(e); } finally { setLoading(false); }
+  };
+
+  // Session expired or barber removed: back to the customer view.
+  const handleStaffError = (e: unknown) => {
+    if (e instanceof ApiError && e.status === 401) {
+      signOut();
+      alert('Your session has ended. Please sign in again.');
+    } else {
+      alert(errorMessage(e));
     }
   };
 
+  const staffAction = async (fn: () => Promise<unknown>, refresh: Array<() => Promise<void>> = [fetchAppointments]) => {
+    try {
+      await fn();
+      await Promise.all(refresh.map(r => r()));
+      return true;
+    } catch (e) {
+      handleStaffError(e);
+      return false;
+    }
+  };
+
+  const signOut = () => {
+    appointmentService.logout();
+    setUser(null);
+    setAppointments([]);
+    setView('customer');
+    fetchBarbers();
+  };
+
+  // ---------------------------------------------------------------- customer actions
+
   const handleBook = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    const form = e.currentTarget;
     setBookingStatus('submitting');
-    const formData = new FormData(e.currentTarget);
+    setBookingError('');
+    const formData = new FormData(form);
     const barberVal = formData.get('barber_id') as string;
     const newApp: NewAppointment = {
       customer_name: formData.get('name') as string,
@@ -90,137 +278,104 @@ export default function App() {
       time: formData.get('time') as string,
       barber_id: barberVal ? Number(barberVal) : null,
     };
-
     try {
-      await appointmentService.create(newApp);
-      setBookingStatus('success');
-      fetchAppointments();
-      setTimeout(() => setBookingStatus('idle'), 3000);
-      (e.target as HTMLFormElement).reset();
+      const booking = await appointmentService.create(newApp);
+      setLastBooking({ booking, phone: newApp.customer_phone });
+      form.reset();
     } catch (error) {
+      setBookingError(errorMessage(error));
+    } finally {
       setBookingStatus('idle');
-      alert('Failed to book appointment');
     }
   };
 
-  const handleUpdateStatus = async (id: number, status: Appointment['status']) => {
-    try {
-      await appointmentService.update(id, { status });
-      fetchAppointments();
-    } catch (error) {
-      alert('Update failed');
-    }
-  };
+  // ---------------------------------------------------------------- staff actions
 
-  const handleDelete = async (id: number) => {
-    if (!confirm('Are you sure?')) return;
-    try {
-      await appointmentService.delete(id);
-      fetchAppointments();
-    } catch (error) {
-      alert('Delete failed');
-    }
+  const handleUpdateStatus = (id: number, status: AppointmentStatus) =>
+    staffAction(() => appointmentService.update(id, { status }));
+
+  const handleReassign = (id: number, barberVal: string) =>
+    staffAction(() => appointmentService.update(id, { barber_id: barberVal ? Number(barberVal) : null }));
+
+  const handleDelete = (id: number) => {
+    if (!confirm('Permanently delete this appointment? To keep a record, cancel it instead.')) return;
+    staffAction(() => appointmentService.delete(id));
   };
 
   const handleSaveEdit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!editingAppointment) return;
-
     const formData = new FormData(e.currentTarget);
     const barberVal = formData.get('barber_id') as string;
-    const updates = {
+    const ok = await staffAction(() => appointmentService.update(editingAppointment.id, {
       customer_name: formData.get('name') as string,
       customer_phone: formData.get('phone') as string,
       date: formData.get('date') as string,
       time: formData.get('time') as string,
       barber_id: barberVal ? Number(barberVal) : null,
-    };
-
-    try {
-      await appointmentService.update(editingAppointment.id, updates);
-      setEditingAppointment(null);
-      fetchAppointments();
-    } catch (error) {
-      alert('Update failed');
-    }
+    }));
+    if (ok) setEditingAppointment(null);
   };
 
   const handleUpdateOpeningHours = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    setIsUpdatingHours(true);
-    const formData = new FormData(e.currentTarget);
-    const value = formData.get('opening_hours') as string;
-    try {
-      await appointmentService.updateSetting('opening_hours', value);
-      await fetchSettings();
-      setIsEditingHours(false);
-    } catch (error) {
-      alert('Failed to update opening hours');
-    } finally {
-      setIsUpdatingHours(false);
-    }
+    const value = new FormData(e.currentTarget).get('opening_hours') as string;
+    if (await staffAction(() => appointmentService.updateSetting('opening_hours', value), [fetchSettings])) setIsEditingHours(false);
   };
+
+  const handleApprovalMode = (mode: 'auto' | 'manual') =>
+    staffAction(() => appointmentService.updateSetting('approval_mode', mode), [fetchSettings]);
 
   const handleAddBarber = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    const name = formData.get('name') as string;
-    const specialty = formData.get('specialty') as string;
-    try {
-      await appointmentService.createBarber({ name, specialty });
-      await fetchBarbers();
-      setShowAddBarber(false);
-      (e.target as HTMLFormElement).reset();
-    } catch { alert('Failed to add barber'); }
+    const form = e.currentTarget;
+    const formData = new FormData(form);
+    const ok = await staffAction(() => appointmentService.createBarber({
+      name: formData.get('name') as string,
+      specialty: formData.get('specialty') as string,
+      password: (formData.get('password') as string) || undefined,
+    }), [fetchBarbers]);
+    if (ok) { setShowAddBarber(false); form.reset(); }
   };
 
   const handleSaveBarber = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!editingBarber) return;
     const formData = new FormData(e.currentTarget);
-    const name = formData.get('name') as string;
-    const specialty = formData.get('specialty') as string;
-    try {
-      await appointmentService.updateBarber(editingBarber.id, { name, specialty });
-      await fetchBarbers();
-      setEditingBarber(null);
-    } catch { alert('Failed to update barber'); }
+    const ok = await staffAction(() => appointmentService.updateBarber(editingBarber.id, {
+      name: formData.get('name') as string,
+      specialty: formData.get('specialty') as string,
+      password: (formData.get('password') as string) || undefined,
+    }), [fetchBarbers, fetchAppointments]);
+    if (ok) setEditingBarber(null);
   };
 
-  const handleDeleteBarber = async (id: number) => {
-    if (!confirm('Remove this barber? Their appointments will become unassigned.')) return;
-    try {
-      await appointmentService.deleteBarber(id);
-      await fetchBarbers();
-      await fetchAppointments();
-    } catch { alert('Failed to delete barber'); }
-  };
-
-  const handleAdminAuth = (e: React.FormEvent) => {
+  const handleRemoveBarber = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    // In a real app, this would be a server-side check.
-    // For this demo, we use a simple client-side check with a password from env.
-    const correctPassword = 'admin'; // Default fallback
-    if (passwordInput === correctPassword) {
-      setIsAdminAuthenticated(true);
-      setShowPasswordPrompt(false);
-      setView('admin');
-    } else {
-      alert('Incorrect password');
-    }
+    if (!removingBarber) return;
+    const formData = new FormData(e.currentTarget);
+    const action = formData.get('action') as BarberRemovalAction;
+    const target = formData.get('reassign_to') as string;
+    const ok = await staffAction(
+      () => appointmentService.deleteBarber(removingBarber.id, action, target ? Number(target) : undefined),
+      [fetchBarbers, fetchAppointments],
+    );
+    if (ok) setRemovingBarber(null);
   };
 
   const toggleView = () => {
-    if (view === 'customer') {
-      if (isAdminAuthenticated) {
-        setView('admin');
-      } else {
-        setShowPasswordPrompt(true);
-      }
-    } else {
-      setView('customer');
-    }
+    if (view === 'staff') setView('customer');
+    else if (user) setView('staff');
+    else setShowLogin(true);
   };
+
+  const shownAppointments = barberFilter === 'all' ? appointments
+    : barberFilter === 'unassigned' ? appointments.filter(a => a.barber_id === null)
+    : appointments.filter(a => a.barber_id === Number(barberFilter));
+  const pendingCount = appointments.filter(a => a.status === 'pending').length;
+  const upcomingForRemoval = removingBarber
+    ? appointments.filter(a => a.barber_id === removingBarber.id && a.status !== 'cancelled' && a.date >= todayLocal()).length
+    : 0;
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -233,23 +388,29 @@ export default function App() {
             </div>
             <span className="font-serif text-xl font-semibold tracking-tight">TrimTime</span>
           </div>
-          
-          <button 
-            onClick={toggleView}
-            className="flex items-center gap-2 text-sm font-medium px-4 py-2 rounded-full border border-black/10 hover:bg-black hover:text-white transition-colors"
-          >
-            {view === 'customer' ? (
-              <>
-                <Settings className="w-4 h-4" />
-                Barber Admin
-              </>
-            ) : (
-              <>
-                <User className="w-4 h-4" />
-                Customer View
-              </>
+
+          <div className="flex items-center gap-2">
+            {view === 'customer' && (
+              <button onClick={() => setMyBooking(null)} className="flex items-center gap-2 text-sm font-medium px-4 py-2 rounded-full hover:bg-black/5 transition-colors">
+                <Ticket className="w-4 h-4" /> My Booking
+              </button>
             )}
-          </button>
+            <button
+              onClick={toggleView}
+              className="flex items-center gap-2 text-sm font-medium px-4 py-2 rounded-full border border-black/10 hover:bg-black hover:text-white transition-colors"
+            >
+              {view === 'customer' ? (
+                <><Settings className="w-4 h-4" /> {user ? 'Dashboard' : 'Staff Login'}</>
+              ) : (
+                <><User className="w-4 h-4" /> Customer View</>
+              )}
+            </button>
+            {user && (
+              <button onClick={signOut} title={`Sign out ${user.name}`} className="p-2 rounded-full hover:bg-black/5 text-black/50 hover:text-black transition-colors">
+                <LogOut className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         </div>
       </nav>
 
@@ -272,7 +433,7 @@ export default function App() {
                 <p className="text-lg text-black/60 max-w-md leading-relaxed">
                   Book your next session with master barbers. We specialize in classic cuts, modern fades, and precision beard grooming.
                 </p>
-                
+
                 <div className="space-y-4 pt-8">
                   <div className="flex items-center gap-4 group">
                     <div className="w-12 h-12 rounded-full border border-black/10 flex items-center justify-center group-hover:bg-black group-hover:text-white transition-all">
@@ -286,341 +447,316 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right Side: Booking Form */}
+              {/* Right Side: Booking Form or confirmation */}
               <div className="glass-card rounded-3xl p-8 lg:p-10">
-                <h2 className="text-2xl font-serif mb-8">Reserve your spot</h2>
-                <form onSubmit={handleBook} className="space-y-6">
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Full Name</label>
-                    <div className="relative">
-                      <User className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
-                      <input 
-                        name="name"
-                        required
-                        placeholder="John Doe"
-                        className="w-full pl-12 pr-4 py-4 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                      />
+                {lastBooking ? (
+                  <div className="space-y-6 text-center">
+                    <CheckCircle2 className="w-12 h-12 mx-auto text-emerald-600" />
+                    <h2 className="text-2xl font-serif">
+                      {lastBooking.booking.status === 'confirmed' ? "You're booked!" : 'Request received'}
+                    </h2>
+                    <p className="text-black/60">
+                      {lastBooking.booking.date} at {slotLabel(lastBooking.booking.time)}
+                      {lastBooking.booking.barber_name ? ` with ${lastBooking.booking.barber_name}` : ''}
+                    </p>
+                    <div className="p-4 rounded-xl bg-black/[0.03] border border-black/5">
+                      <p className={labelClass}>Your booking code</p>
+                      <p className="font-mono text-3xl tracking-[0.3em] mt-1">{lastBooking.booking.ref}</p>
+                    </div>
+                    <p className="text-sm text-black/50">
+                      {lastBooking.booking.status === 'confirmed'
+                        ? 'Your appointment is confirmed.'
+                        : 'Your barber will review your request. Use "My Booking" with this code to check when it’s confirmed.'}
+                      {' '}You can cancel online up to {lastBooking.booking.cancel_cutoff_hours} hours before. Keep this code.
+                    </p>
+                    <div className="flex gap-3">
+                      <button onClick={() => setMyBooking({ ref: lastBooking.booking.ref, phone: lastBooking.phone })} className="flex-1 py-4 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all">
+                        View booking
+                      </button>
+                      <button onClick={() => setLastBooking(null)} className="flex-1 bg-black text-white py-4 rounded-xl font-semibold hover:bg-black/90 transition-all">
+                        Book another
+                      </button>
                     </div>
                   </div>
-
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Phone Number</label>
-                    <div className="relative">
-                      <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
-                      <input 
-                        name="phone"
-                        required
-                        type="tel"
-                        placeholder="(555) 000-0000"
-                        className="w-full pl-12 pr-4 py-4 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                      />
-                    </div>
-                  </div>
-
-                  {barbers.length > 0 && (
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold uppercase tracking-widest text-black/40">Select Barber</label>
-                      <div className="relative">
-                        <Scissors className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
-                        <select
-                          name="barber_id"
-                          className="w-full pl-12 pr-4 py-4 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all appearance-none"
-                        >
-                          <option value="">No preference</option>
-                          {barbers.map(b => (
-                            <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>
-                          ))}
-                        </select>
+                ) : (
+                  <>
+                    <h2 className="text-2xl font-serif mb-8">Reserve your spot</h2>
+                    <form onSubmit={handleBook} className="space-y-6">
+                      <div className="space-y-2">
+                        <label className={labelClass}>Full Name</label>
+                        <div className="relative">
+                          <User className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
+                          <input name="name" required placeholder="John Doe" className={`${fieldBase} pl-12 pr-4 py-4`} />
+                        </div>
                       </div>
-                    </div>
-                  )}
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold uppercase tracking-widest text-black/40">Date</label>
-                      <input
-                        name="date"
-                        required
-                        type="date"
-                        min={new Date().toISOString().split('T')[0]}
-                        className="w-full px-4 py-4 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold uppercase tracking-widest text-black/40">Time</label>
-                      <select 
-                        name="time"
-                        required
-                        className="w-full px-4 py-4 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all appearance-none"
-                      >
-                        <option value="09:00">09:00 AM</option>
-                        <option value="10:00">10:00 AM</option>
-                        <option value="11:00">11:00 AM</option>
-                        <option value="12:00">12:00 PM</option>
-                        <option value="13:00">01:00 PM</option>
-                        <option value="14:00">02:00 PM</option>
-                        <option value="15:00">03:00 PM</option>
-                        <option value="16:00">04:00 PM</option>
-                        <option value="17:00">05:00 PM</option>
-                        <option value="18:00">06:00 PM</option>
-                      </select>
-                    </div>
-                  </div>
+                      <div className="space-y-2">
+                        <label className={labelClass}>Phone Number</label>
+                        <div className="relative">
+                          <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
+                          <input name="phone" required type="tel" placeholder="(555) 000-0000" className={`${fieldBase} pl-12 pr-4 py-4`} />
+                        </div>
+                      </div>
 
-                  <button 
-                    disabled={bookingStatus === 'submitting'}
-                    className="w-full bg-black text-white py-5 rounded-xl font-semibold flex items-center justify-center gap-2 hover:bg-black/90 transition-all disabled:opacity-50"
-                  >
-                    {bookingStatus === 'submitting' ? 'Processing...' : bookingStatus === 'success' ? (
-                      <>
-                        <CheckCircle2 className="w-5 h-5" />
-                        Booked Successfully
-                      </>
-                    ) : (
-                      <>
-                        Book Appointment
-                        <ChevronRight className="w-4 h-4" />
-                      </>
-                    )}
-                  </button>
-                </form>
+                      {barbers.length > 0 && (
+                        <div className="space-y-2">
+                          <label className={labelClass}>Select Barber</label>
+                          <div className="relative">
+                            <Scissors className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
+                            <select name="barber_id" className={`${fieldBase} pl-12 pr-4 py-4 appearance-none`}>
+                              <option value="">No preference</option>
+                              {barbers.map(b => <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <label className={labelClass}>Date</label>
+                          <input name="date" required type="date" min={todayLocal()} className={`${fieldBase} px-4 py-4`} />
+                        </div>
+                        <div className="space-y-2">
+                          <label className={labelClass}>Time</label>
+                          <select name="time" required className={`${fieldBase} px-4 py-4 appearance-none`}>
+                            {TIME_SLOTS.map(t => <option key={t} value={t}>{slotLabel(t)}</option>)}
+                          </select>
+                        </div>
+                      </div>
+
+                      <p className="text-xs text-black/40">
+                        Book at least {settings.min_lead_hours || 1} hour ahead.
+                        {settings.approval_mode !== 'auto' && ' Your barber approves each booking; you can check its status under "My Booking".'}
+                      </p>
+
+                      {bookingError && <p className="text-sm text-red-600">{bookingError}</p>}
+
+                      <button disabled={bookingStatus === 'submitting'} className={primaryButton.replace('py-4', 'py-5')}>
+                        {bookingStatus === 'submitting' ? 'Processing...' : <>Book Appointment <ChevronRight className="w-4 h-4" /></>}
+                      </button>
+                    </form>
+                  </>
+                )}
               </div>
             </motion.div>
           ) : (
             <motion.div
-              key="admin"
+              key="staff"
               initial={{ opacity: 0, scale: 0.98 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.98 }}
               className="space-y-8"
             >
-              <div className="flex items-end justify-between">
+              <div className="flex items-end justify-between flex-wrap gap-4">
                 <div>
-                  <h1 className="font-serif text-4xl">Appointment Manager</h1>
-                  <p className="text-black/40">Manage your schedule and customer requests</p>
+                  <h1 className="font-serif text-4xl">{isAdmin ? 'Appointment Manager' : 'Your Bookings'}</h1>
+                  <p className="text-black/40">
+                    {isAdmin ? 'Manage the shop schedule, barbers and settings' : `Signed in as ${user?.name}. Approve or cancel your bookings.`}
+                  </p>
                 </div>
-                <div className="flex gap-4">
-                  <div className="px-4 py-2 bg-black/5 rounded-lg text-sm font-medium">
-                    {appointments.length} Total
-                  </div>
+                <div className="flex gap-2">
+                  {pendingCount > 0 && (
+                    <div className="px-4 py-2 bg-amber-100 text-amber-800 rounded-lg text-sm font-medium">{pendingCount} awaiting approval</div>
+                  )}
+                  <div className="px-4 py-2 bg-black/5 rounded-lg text-sm font-medium">{appointments.length} Total</div>
                 </div>
               </div>
 
-              {/* Opening Hours Setting */}
-              <div className="glass-card rounded-2xl p-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Clock className="w-5 h-5 text-black/40" />
-                    <h2 className="text-xl font-serif">Manage Opening Hours</h2>
-                  </div>
-                  {!isEditingHours && (
-                    <button 
-                      onClick={() => setIsEditingHours(true)}
-                      className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors"
-                      title="Edit Hours"
-                    >
-                      <Pencil className="w-5 h-5" />
-                    </button>
-                  )}
-                </div>
-
-                <AnimatePresence mode="wait">
-                  {isEditingHours ? (
-                    <motion.form 
-                      key="edit-form"
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -10 }}
-                      onSubmit={handleUpdateOpeningHours} 
-                      className="flex flex-col md:flex-row gap-4 items-end"
-                    >
-                      <div className="flex-1 space-y-2 w-full">
-                        <label className="text-xs font-bold uppercase tracking-widest text-black/40">Opening Hours Text</label>
-                        <input 
-                          key={settings.opening_hours}
-                          name="opening_hours"
-                          required
-                          autoFocus
-                          defaultValue={settings.opening_hours}
-                          className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                        />
-                      </div>
-                      <div className="flex gap-2 w-full md:w-auto">
-                        <button 
-                          type="button"
-                          onClick={() => setIsEditingHours(false)}
-                          className="flex-1 md:flex-none px-6 py-3 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all"
-                        >
-                          Cancel
-                        </button>
-                        <button 
-                          type="submit"
-                          disabled={isUpdatingHours}
-                          className="flex-1 md:flex-none bg-black text-white px-6 py-3 rounded-xl font-semibold hover:bg-black/90 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-                        >
-                          {isUpdatingHours ? (
-                            'Saving...'
-                          ) : (
-                            <>
-                              <Save className="w-4 h-4" />
-                              Update Hours
-                            </>
-                          )}
-                        </button>
-                      </div>
-                    </motion.form>
-                  ) : (
-                    <motion.div 
-                      key="display-hours"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      className="p-4 rounded-xl bg-black/[0.02] border border-black/5"
-                    >
-                      <p className="text-lg font-medium">{settings.opening_hours}</p>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-
-              {/* Barber Management */}
-              <div className="glass-card rounded-2xl p-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Scissors className="w-5 h-5 text-black/40" />
-                    <h2 className="text-xl font-serif">Manage Barbers</h2>
-                  </div>
-                  <button
-                    onClick={() => setShowAddBarber(v => !v)}
-                    className="text-sm font-semibold px-4 py-2 rounded-full border border-black/10 hover:bg-black hover:text-white transition-colors"
-                  >
-                    {showAddBarber ? 'Cancel' : '+ Add Barber'}
-                  </button>
-                </div>
-
-                <AnimatePresence>
-                  {showAddBarber && (
-                    <motion.form
-                      initial={{ opacity: 0, y: -8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -8 }}
-                      onSubmit={handleAddBarber}
-                      className="flex flex-col md:flex-row gap-3 items-end p-4 rounded-xl bg-black/[0.02] border border-black/5"
-                    >
-                      <div className="flex-1 space-y-1 w-full">
-                        <label className="text-xs font-bold uppercase tracking-widest text-black/40">Name</label>
-                        <input name="name" required placeholder="Barber name" className="w-full px-4 py-3 rounded-xl border border-black/5 bg-white focus:outline-none focus:ring-2 focus:ring-black/5" />
-                      </div>
-                      <div className="flex-1 space-y-1 w-full">
-                        <label className="text-xs font-bold uppercase tracking-widest text-black/40">Specialty</label>
-                        <input name="specialty" required placeholder="e.g. Fades & Tapers" className="w-full px-4 py-3 rounded-xl border border-black/5 bg-white focus:outline-none focus:ring-2 focus:ring-black/5" />
-                      </div>
-                      <button type="submit" className="bg-black text-white px-6 py-3 rounded-xl font-semibold hover:bg-black/90 transition-all whitespace-nowrap">Add Barber</button>
-                    </motion.form>
-                  )}
-                </AnimatePresence>
-
-                <div className="grid gap-3">
-                  {barbers.length === 0 ? (
-                    <p className="text-sm text-black/30 italic text-center py-4">No barbers yet. Add one above.</p>
-                  ) : barbers.map(barber => (
-                    <div key={barber.id} className="flex items-center justify-between px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02]">
-                      <div>
-                        <p className="font-semibold">{barber.name}</p>
-                        <p className="text-sm text-black/40">{barber.specialty}</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button onClick={() => setEditingBarber(barber)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Edit"><Pencil className="w-4 h-4" /></button>
-                        <button onClick={() => handleDeleteBarber(barber.id)} className="p-2 rounded-lg hover:bg-red-50 text-black/40 hover:text-red-600 transition-colors" title="Remove"><Trash2 className="w-4 h-4" /></button>
-                      </div>
+              {isAdmin && (
+                <>
+                  {/* Shop settings */}
+                  <div className="glass-card rounded-2xl p-6 space-y-6">
+                    <div className="flex items-center gap-2">
+                      <Settings className="w-5 h-5 text-black/40" />
+                      <h2 className="text-xl font-serif">Shop Settings</h2>
                     </div>
-                  ))}
-                </div>
-              </div>
+
+                    <div className="space-y-2">
+                      <p className={labelClass}>Booking approval</p>
+                      <div className="inline-flex rounded-xl border border-black/10 p-1 bg-black/[0.02]">
+                        {(['manual', 'auto'] as const).map(mode => (
+                          <button
+                            key={mode}
+                            onClick={() => handleApprovalMode(mode)}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all ${settings.approval_mode === mode ? 'bg-black text-white' : 'text-black/50 hover:text-black'}`}
+                          >
+                            {mode === 'manual' ? 'Manual approval' : 'Auto-approve'}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-sm text-black/40">
+                        {settings.approval_mode === 'auto'
+                          ? 'New bookings are confirmed immediately.'
+                          : 'New bookings wait for the barber (or admin) to approve them.'}
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <p className={labelClass}>Opening hours</p>
+                        {!isEditingHours && (
+                          <button onClick={() => setIsEditingHours(true)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Edit Hours">
+                            <Pencil className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+                      {isEditingHours ? (
+                        <form onSubmit={handleUpdateOpeningHours} className="flex flex-col md:flex-row gap-3 items-end">
+                          <input name="opening_hours" required autoFocus defaultValue={settings.opening_hours} className={`${inputClass} flex-1`} />
+                          <div className="flex gap-2 w-full md:w-auto">
+                            <button type="button" onClick={() => setIsEditingHours(false)} className="flex-1 md:flex-none px-6 py-3 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all">Cancel</button>
+                            <button type="submit" className="flex-1 md:flex-none bg-black text-white px-6 py-3 rounded-xl font-semibold hover:bg-black/90 transition-all flex items-center justify-center gap-2">
+                              <Save className="w-4 h-4" /> Update
+                            </button>
+                          </div>
+                        </form>
+                      ) : (
+                        <p className="p-4 rounded-xl bg-black/[0.02] border border-black/5 font-medium">{settings.opening_hours}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Barber Management */}
+                  <div className="glass-card rounded-2xl p-6 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Scissors className="w-5 h-5 text-black/40" />
+                        <h2 className="text-xl font-serif">Manage Barbers</h2>
+                      </div>
+                      <button onClick={() => setShowAddBarber(v => !v)} className="text-sm font-semibold px-4 py-2 rounded-full border border-black/10 hover:bg-black hover:text-white transition-colors">
+                        {showAddBarber ? 'Cancel' : '+ Add Barber'}
+                      </button>
+                    </div>
+
+                    <AnimatePresence>
+                      {showAddBarber && (
+                        <motion.form
+                          initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
+                          onSubmit={handleAddBarber}
+                          className="grid md:grid-cols-4 gap-3 items-end p-4 rounded-xl bg-black/[0.02] border border-black/5"
+                        >
+                          <div className="space-y-1">
+                            <label className={labelClass}>Name</label>
+                            <input name="name" required placeholder="Barber name" className={`w-full rounded-xl border border-black/5 bg-white px-4 py-3 focus:outline-none focus:ring-2 focus:ring-black/5`} />
+                          </div>
+                          <div className="space-y-1">
+                            <label className={labelClass}>Specialty</label>
+                            <input name="specialty" required placeholder="e.g. Fades & Tapers" className={`w-full rounded-xl border border-black/5 bg-white px-4 py-3 focus:outline-none focus:ring-2 focus:ring-black/5`} />
+                          </div>
+                          <div className="space-y-1">
+                            <label className={labelClass}>Login password</label>
+                            <input name="password" type="password" minLength={4} placeholder="Optional" className={`w-full rounded-xl border border-black/5 bg-white px-4 py-3 focus:outline-none focus:ring-2 focus:ring-black/5`} />
+                          </div>
+                          <button type="submit" className="bg-black text-white px-6 py-3 rounded-xl font-semibold hover:bg-black/90 transition-all whitespace-nowrap">Add Barber</button>
+                        </motion.form>
+                      )}
+                    </AnimatePresence>
+
+                    <div className="grid gap-3">
+                      {barbers.length === 0 ? (
+                        <p className="text-sm text-black/30 italic text-center py-4">No barbers yet. Add one above.</p>
+                      ) : barbers.map(barber => (
+                        <div key={barber.id} className="flex items-center justify-between px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02]">
+                          <div>
+                            <p className="font-semibold">{barber.name}</p>
+                            <p className="text-sm text-black/40">
+                              {barber.specialty} · {barber.has_login ? 'Can sign in' : <span className="text-amber-700">No login yet — set a password</span>}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button onClick={() => setEditingBarber(barber)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Edit / set password"><Pencil className="w-4 h-4" /></button>
+                            <button onClick={() => setRemovingBarber(barber)} className="p-2 rounded-lg hover:bg-red-50 text-black/40 hover:text-red-600 transition-colors" title="Remove"><Trash2 className="w-4 h-4" /></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <label className={labelClass}>Show</label>
+                    <select value={barberFilter} onChange={e => setBarberFilter(e.target.value)} className="px-4 py-2 rounded-xl border border-black/10 bg-white text-sm">
+                      <option value="all">All barbers</option>
+                      <option value="unassigned">Unassigned</option>
+                      {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                    </select>
+                  </div>
+                </>
+              )}
 
               <div className="grid gap-4">
                 {loading ? (
                   <div className="py-20 text-center text-black/20 font-serif text-2xl">Loading schedule...</div>
-                ) : appointments.length === 0 ? (
+                ) : shownAppointments.length === 0 ? (
                   <div className="py-20 text-center text-black/20 font-serif text-2xl">No appointments found</div>
                 ) : (
-                  appointments.map((app) => (
-                    <div 
-                      key={app.id}
-                      className="glass-card rounded-2xl p-6 flex flex-col md:flex-row md:items-center justify-between gap-6 hover:border-black/20 transition-all"
-                    >
+                  shownAppointments.map(app => (
+                    <div key={app.id} className="glass-card rounded-2xl p-6 flex flex-col md:flex-row md:items-center justify-between gap-6 hover:border-black/20 transition-all">
                       <div className="flex items-center gap-6">
                         <div className="w-14 h-14 rounded-full bg-black/5 flex items-center justify-center text-xl font-serif">
                           {app.customer_name[0]}
                         </div>
                         <div>
                           <h3 className="font-semibold text-lg">{app.customer_name}</h3>
-                          <p className="text-sm text-black/40 flex items-center gap-1">
-                            <Phone className="w-3 h-3" /> {app.customer_phone}
-                          </p>
+                          <p className="text-sm text-black/40 flex items-center gap-1"><Phone className="w-3 h-3" /> {app.customer_phone}</p>
+                          <p className="text-xs text-black/30 font-mono mt-1">#{app.ref}</p>
                         </div>
                       </div>
 
                       <div className="flex flex-wrap items-center gap-8">
                         <div className="space-y-1">
                           <p className="text-[10px] font-bold uppercase tracking-widest text-black/30">Barber</p>
-                          <div className="flex items-center gap-2 font-medium">
-                            <Scissors className="w-4 h-4 text-black/40" />
-                            {app.barber_name || <span className="text-black/30 italic">Unassigned</span>}
-                          </div>
+                          {isAdmin ? (
+                            <select
+                              value={app.barber_id ?? ''}
+                              onChange={e => handleReassign(app.id, e.target.value)}
+                              className="px-2 py-1 rounded-lg border border-black/10 bg-white text-sm font-medium"
+                              title="Reassign"
+                            >
+                              <option value="">Unassigned</option>
+                              {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                            </select>
+                          ) : (
+                            <div className="flex items-center gap-2 font-medium"><Scissors className="w-4 h-4 text-black/40" />{app.barber_name}</div>
+                          )}
                         </div>
 
                         <div className="space-y-1">
                           <p className="text-[10px] font-bold uppercase tracking-widest text-black/30">Date & Time</p>
                           <div className="flex items-center gap-2 font-medium">
                             <CalendarDays className="w-4 h-4 text-black/40" />
-                            {app.date} at {app.time}
+                            {app.date} at {slotLabel(app.time)}
                           </div>
                         </div>
 
                         <div className="space-y-1">
                           <p className="text-[10px] font-bold uppercase tracking-widest text-black/30">Status</p>
-                          <div className={`text-xs font-bold uppercase tracking-widest px-2 py-1 rounded-md ${
-                            app.status === 'confirmed' ? 'bg-emerald-100 text-emerald-700' :
-                            app.status === 'cancelled' ? 'bg-red-100 text-red-700' :
-                            'bg-amber-100 text-amber-700'
-                          }`}>
-                            {app.status}
-                          </div>
+                          <StatusBadge status={app.status} />
+                          {app.status === 'cancelled' && app.cancelled_by && (
+                            <p className="text-[10px] text-black/30">by {app.cancelled_by}</p>
+                          )}
                         </div>
 
                         <div className="flex items-center gap-2">
                           {app.status !== 'confirmed' && (
-                            <button 
-                              onClick={() => handleUpdateStatus(app.id, 'confirmed')}
-                              className="p-2 rounded-lg hover:bg-emerald-50 text-emerald-600 transition-colors"
-                              title="Confirm"
-                            >
+                            <button onClick={() => handleUpdateStatus(app.id, 'confirmed')} className="p-2 rounded-lg hover:bg-emerald-50 text-emerald-600 transition-colors" title="Approve / confirm">
                               <CheckCircle2 className="w-5 h-5" />
                             </button>
                           )}
                           {app.status !== 'cancelled' && (
-                            <button 
-                              onClick={() => handleUpdateStatus(app.id, 'cancelled')}
-                              className="p-2 rounded-lg hover:bg-red-50 text-red-600 transition-colors"
-                              title="Cancel"
-                            >
+                            <button onClick={() => confirm('Cancel this appointment?') && handleUpdateStatus(app.id, 'cancelled')} className="p-2 rounded-lg hover:bg-red-50 text-red-600 transition-colors" title="Cancel">
                               <X className="w-5 h-5" />
                             </button>
                           )}
-                          <button 
-                            onClick={() => setEditingAppointment(app)}
-                            className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors"
-                            title="Edit"
-                          >
-                            <Pencil className="w-5 h-5" />
-                          </button>
-                          <button 
-                            onClick={() => handleDelete(app.id)}
-                            className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-5 h-5" />
-                          </button>
+                          {isAdmin && (
+                            <>
+                              <button onClick={() => setEditingAppointment(app)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Edit">
+                                <Pencil className="w-5 h-5" />
+                              </button>
+                              <button onClick={() => handleDelete(app.id)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Delete">
+                                <Trash2 className="w-5 h-5" />
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -631,193 +767,93 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Password Prompt Modal */}
         <AnimatePresence>
-          {showPasswordPrompt && (
-            <div className="fixed inset-0 z-[110] flex items-center justify-center p-6">
-              <motion.div 
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                onClick={() => setShowPasswordPrompt(false)}
-                className="absolute inset-0 bg-black/40 backdrop-blur-sm"
-              />
-              <motion.div 
-                initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="relative w-full max-w-sm bg-white rounded-3xl shadow-2xl p-8"
-              >
-                <div className="flex items-center justify-between mb-6">
-                  <div className="flex items-center gap-2">
-                    <Lock className="w-5 h-5 text-black/40" />
-                    <h2 className="text-xl font-serif">Admin Access</h2>
-                  </div>
-                  <button 
-                    onClick={() => setShowPasswordPrompt(false)}
-                    className="p-2 hover:bg-black/5 rounded-full transition-colors"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
+          {myBooking !== false && <MyBooking initial={myBooking} onClose={() => setMyBooking(false)} />}
+        </AnimatePresence>
 
-                <form onSubmit={handleAdminAuth} className="space-y-4">
-                  <p className="text-sm text-black/40">Enter the barber password to access the admin panel.</p>
-                  <input 
-                    type="password"
-                    required
-                    autoFocus
-                    placeholder="Password"
-                    value={passwordInput}
-                    onChange={(e) => setPasswordInput(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                  />
-                  <button 
-                    type="submit"
-                    className="w-full bg-black text-white py-4 rounded-xl font-semibold flex items-center justify-center gap-2 hover:bg-black/90 transition-all"
-                  >
-                    Unlock Admin
-                  </button>
-                </form>
-              </motion.div>
-            </div>
+        <AnimatePresence>
+          {showLogin && (
+            <StaffLogin
+              barbers={barbers}
+              onClose={() => setShowLogin(false)}
+              onSignedIn={u => { setUser(u); setShowLogin(false); setView('staff'); }}
+            />
           )}
         </AnimatePresence>
 
         {/* Edit Barber Modal */}
         <AnimatePresence>
           {editingBarber && (
-            <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setEditingBarber(null)} className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
-              <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 20 }} className="relative w-full max-w-sm bg-white rounded-3xl shadow-2xl p-8">
-                <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-xl font-serif">Edit Barber</h2>
-                  <button onClick={() => setEditingBarber(null)} className="p-2 hover:bg-black/5 rounded-full transition-colors"><X className="w-5 h-5" /></button>
+            <Modal title="Edit Barber" onClose={() => setEditingBarber(null)}>
+              <form onSubmit={handleSaveBarber} className="space-y-4">
+                <div className="space-y-2">
+                  <label className={labelClass}>Name</label>
+                  <input name="name" required defaultValue={editingBarber.name} className={inputClass} />
                 </div>
-                <form onSubmit={handleSaveBarber} className="space-y-4">
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Name</label>
-                    <input name="name" required defaultValue={editingBarber.name} className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5" />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Specialty</label>
-                    <input name="specialty" required defaultValue={editingBarber.specialty} className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5" />
-                  </div>
-                  <button type="submit" className="w-full bg-black text-white py-4 rounded-xl font-semibold flex items-center justify-center gap-2 hover:bg-black/90 transition-all">
-                    <Save className="w-4 h-4" /> Save Changes
-                  </button>
-                </form>
-              </motion.div>
-            </div>
+                <div className="space-y-2">
+                  <label className={labelClass}>Specialty</label>
+                  <input name="specialty" required defaultValue={editingBarber.specialty} className={inputClass} />
+                </div>
+                <div className="space-y-2">
+                  <label className={`${labelClass} flex items-center gap-1`}><KeyRound className="w-3 h-3" /> {editingBarber.has_login ? 'Reset login password' : 'Set login password'}</label>
+                  <input name="password" type="password" minLength={4} placeholder={editingBarber.has_login ? 'Leave blank to keep current' : 'At least 4 characters'} className={inputClass} />
+                </div>
+                <button type="submit" className={primaryButton}><Save className="w-4 h-4" /> Save Changes</button>
+              </form>
+            </Modal>
           )}
         </AnimatePresence>
 
-        {/* Edit Modal */}
+        {/* Remove Barber Modal */}
+        <AnimatePresence>
+          {removingBarber && (
+            <Modal title={`Remove ${removingBarber.name}`} icon={<Trash2 className="w-5 h-5 text-red-500" />} onClose={() => setRemovingBarber(null)} wide>
+              <form onSubmit={handleRemoveBarber} className="space-y-4">
+                <p className="text-sm text-black/50">
+                  {removingBarber.name} has {upcomingForRemoval} upcoming booking{upcomingForRemoval === 1 ? '' : 's'}. What should happen to them?
+                </p>
+                <RemovalOptions barbers={barbers.filter(b => b.id !== removingBarber.id)} />
+                <button type="submit" className="w-full bg-red-600 text-white py-4 rounded-xl font-semibold hover:bg-red-700 transition-all">Remove barber</button>
+              </form>
+            </Modal>
+          )}
+        </AnimatePresence>
+
+        {/* Edit Appointment Modal (admin) */}
         <AnimatePresence>
           {editingAppointment && (
-            <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
-              <motion.div 
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                onClick={() => setEditingAppointment(null)}
-                className="absolute inset-0 bg-black/40 backdrop-blur-sm"
-              />
-              <motion.div 
-                initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="relative w-full max-w-md bg-white rounded-3xl shadow-2xl p-8 overflow-hidden"
-              >
-                <div className="flex items-center justify-between mb-8">
-                  <h2 className="text-2xl font-serif">Edit Appointment</h2>
-                  <button 
-                    onClick={() => setEditingAppointment(null)}
-                    className="p-2 hover:bg-black/5 rounded-full transition-colors"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
+            <Modal title="Edit Appointment" onClose={() => setEditingAppointment(null)} wide>
+              <form onSubmit={handleSaveEdit} className="space-y-6">
+                <div className="space-y-2">
+                  <label className={labelClass}>Full Name</label>
+                  <input name="name" required defaultValue={editingAppointment.customer_name} className={inputClass} />
                 </div>
-
-                <form onSubmit={handleSaveEdit} className="space-y-6">
+                <div className="space-y-2">
+                  <label className={labelClass}>Phone Number</label>
+                  <input name="phone" required type="tel" defaultValue={editingAppointment.customer_phone} className={inputClass} />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Full Name</label>
-                    <input 
-                      name="name"
-                      required
-                      defaultValue={editingAppointment.customer_name}
-                      className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                    />
+                    <label className={labelClass}>Date</label>
+                    <input name="date" required type="date" defaultValue={editingAppointment.date} className={inputClass} />
                   </div>
-
                   <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Phone Number</label>
-                    <input 
-                      name="phone"
-                      required
-                      type="tel"
-                      defaultValue={editingAppointment.customer_phone}
-                      className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold uppercase tracking-widest text-black/40">Date</label>
-                      <input 
-                        name="date"
-                        required
-                        type="date"
-                        defaultValue={editingAppointment.date}
-                        className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold uppercase tracking-widest text-black/40">Time</label>
-                      <select 
-                        name="time"
-                        required
-                        defaultValue={editingAppointment.time}
-                        className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all appearance-none"
-                      >
-                        <option value="09:00">09:00 AM</option>
-                        <option value="10:00">10:00 AM</option>
-                        <option value="11:00">11:00 AM</option>
-                        <option value="12:00">12:00 PM</option>
-                        <option value="13:00">01:00 PM</option>
-                        <option value="14:00">02:00 PM</option>
-                        <option value="15:00">03:00 PM</option>
-                        <option value="16:00">04:00 PM</option>
-                        <option value="17:00">05:00 PM</option>
-                        <option value="18:00">06:00 PM</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-black/40">Assign Barber</label>
-                    <select
-                      name="barber_id"
-                      defaultValue={editingAppointment.barber_id ?? ''}
-                      className="w-full px-4 py-3 rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all appearance-none"
-                    >
-                      <option value="">Unassigned</option>
-                      {barbers.map(b => (
-                        <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>
-                      ))}
+                    <label className={labelClass}>Time</label>
+                    <select name="time" required defaultValue={editingAppointment.time} className={`${inputClass} appearance-none`}>
+                      {TIME_SLOTS.map(t => <option key={t} value={t}>{slotLabel(t)}</option>)}
                     </select>
                   </div>
-
-                  <button 
-                    type="submit"
-                    className="w-full bg-black text-white py-4 rounded-xl font-semibold flex items-center justify-center gap-2 hover:bg-black/90 transition-all"
-                  >
-                    <Save className="w-4 h-4" />
-                    Save Changes
-                  </button>
-                </form>
-              </motion.div>
-            </div>
+                </div>
+                <div className="space-y-2">
+                  <label className={labelClass}>Assign Barber</label>
+                  <select name="barber_id" defaultValue={editingAppointment.barber_id ?? ''} className={`${inputClass} appearance-none`}>
+                    <option value="">Unassigned</option>
+                    {barbers.map(b => <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>)}
+                  </select>
+                </div>
+                <button type="submit" className={primaryButton}><Save className="w-4 h-4" /> Save Changes</button>
+              </form>
+            </Modal>
           )}
         </AnimatePresence>
       </main>
@@ -828,10 +864,31 @@ export default function App() {
             <Scissors className="w-4 h-4" />
             <span className="font-serif font-semibold">TrimTime</span>
           </div>
-          <p className="text-sm text-black/40">© 2024 TrimTime Barbershop. All rights reserved.</p>
+          <p className="text-sm text-black/40">© {new Date().getFullYear()} TrimTime Barbershop. All rights reserved.</p>
         </div>
       </footer>
     </div>
   );
 }
 
+function RemovalOptions({ barbers }: { barbers: Barber[] }) {
+  const [action, setAction] = useState<BarberRemovalAction>(barbers.length ? 'reassign' : 'unassign');
+  const option = (value: BarberRemovalAction, label: string, disabled = false) => (
+    <label className={`flex items-center gap-3 p-3 rounded-xl border ${action === value ? 'border-black/30 bg-black/[0.03]' : 'border-black/5'} ${disabled ? 'opacity-40' : 'cursor-pointer'}`}>
+      <input type="radio" name="action" value={value} checked={action === value} disabled={disabled} onChange={() => setAction(value)} />
+      <span className="text-sm font-medium">{label}</span>
+    </label>
+  );
+  return (
+    <div className="space-y-2">
+      {option('reassign', 'Move them to another barber', barbers.length === 0)}
+      {action === 'reassign' && (
+        <select name="reassign_to" required className={`${inputClass} appearance-none`}>
+          {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+        </select>
+      )}
+      {option('unassign', 'Keep them, unassigned (admin assigns later)')}
+      {option('cancel', 'Cancel them')}
+    </div>
+  );
+}
