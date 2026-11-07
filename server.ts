@@ -19,6 +19,7 @@ const handle = (fn: (req: express.Request) => unknown, status = 200) =>
     try {
       const result = fn(req);
       res.status(status).json(result ?? { success: true });
+      deliver(); // send any SMS the request queued
     } catch (err) {
       if (err instanceof HttpError) {
         res.status(err.status).json({ error: err.message });
@@ -28,6 +29,42 @@ const handle = (fn: (req: express.Request) => unknown, status = 200) =>
       }
     }
   };
+
+// SMS delivery: Twilio when TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and
+// TWILIO_FROM are set; otherwise messages are only logged (status 'not_sent').
+const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM } = process.env;
+const smsSender: booking.SmsSender | null = TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM
+  ? async (to, body) => {
+      const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`, {
+        method: "POST",
+        headers: {
+          Authorization: "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({ To: to, From: TWILIO_FROM, Body: body }),
+      });
+      if (!res.ok) throw new Error(`Twilio ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    }
+  : null;
+console.log(smsSender ? "SMS: sending via Twilio" : "SMS: not configured, messages are logged only");
+
+let delivering = false;
+const deliver = () => {
+  if (delivering) return;
+  delivering = true;
+  booking.deliverQueued(db, smsSender).catch(err => console.error("SMS delivery failed", err)).finally(() => { delivering = false; });
+};
+
+// Time-based rules (auto-approve at the deadline, warnings, attendance
+// reminders). Cloud Run may pause idle instances, so they also run on API
+// traffic and via POST /api/jobs/run (for Cloud Scheduler, see TT-027).
+let lastJobRun = 0;
+const runJobs = () => {
+  lastJobRun = Date.now();
+  try { booking.runDueJobs(db); } catch (err) { console.error("Scheduled jobs failed", err); }
+  deliver();
+};
+setInterval(runJobs, 60_000).unref();
 
 const userOf = (req: express.Request) => booking.verifyToken(db, req.headers.authorization);
 const idOf = (req: express.Request) => Number(req.params.id);
@@ -39,6 +76,10 @@ async function startServer() {
   const PORT = process.env.PORT || 3000;
 
   app.use(express.json());
+  app.use("/api", (req, res, next) => {
+    if (Date.now() - lastJobRun > 60_000) runJobs();
+    next();
+  });
 
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", env: process.env.NODE_ENV || "development" });
@@ -46,6 +87,7 @@ async function startServer() {
 
   // Settings
   app.get("/api/settings", handle(() => booking.getPublicSettings(db)));
+  app.get("/api/settings/admin", handle(req => booking.getAdminSettings(db, userOf(req))));
   app.post("/api/settings", handle(req => booking.updateSetting(db, userOf(req), req.body?.key, req.body?.value)));
 
   // Staff sign-in
@@ -60,6 +102,7 @@ async function startServer() {
   app.post("/api/appointments", handle(req => booking.createAppointment(db, req.body), 201));
   app.post("/api/bookings/lookup", handle(req => booking.lookupAppointment(db, req.body?.ref, req.body?.phone)));
   app.post("/api/bookings/cancel", handle(req => booking.cancelByCustomer(db, req.body?.ref, req.body?.phone)));
+  app.post("/api/bookings/confirm", handle(req => booking.confirmAttendance(db, req.body?.ref, req.body?.phone)));
 
   // Staff appointment management (admin: all; barber: own only)
   app.get("/api/appointments", handle(req => booking.listAppointments(db, userOf(req))));
@@ -71,6 +114,19 @@ async function startServer() {
   app.post("/api/barbers", handle(req => booking.createBarber(db, userOf(req), req.body), 201));
   app.patch("/api/barbers/:id", handle(req => booking.updateBarber(db, userOf(req), idOf(req), req.body)));
   app.delete("/api/barbers/:id", handle(req => booking.deleteBarber(db, userOf(req), idOf(req), req.body)));
+
+  // SMS log (admin)
+  app.get("/api/messages", handle(req => booking.listMessages(db, userOf(req))));
+
+  // For Cloud Scheduler: runs the time-based rules. Requires JOB_TOKEN.
+  app.post("/api/jobs/run", (req, res) => {
+    if (!process.env.JOB_TOKEN || req.headers["x-job-token"] !== process.env.JOB_TOKEN) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    runJobs();
+    res.json({ success: true });
+  });
 
   // Vite middleware for development / Static files for production
   if (process.env.NODE_ENV !== "production") {
