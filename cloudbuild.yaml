@@ -1,0 +1,42 @@
+# Cloud Build: build the Docker image, push it to Artifact Registry,
+# and deploy it to Cloud Run. Run by a Cloud Build trigger on pushes to main.
+#
+# Adjust the substitutions below (or override them in the trigger settings)
+# if your Cloud Run service or Artifact Registry repo uses different names.
+substitutions:
+  _SERVICE: trim-time-barber          # Cloud Run service name
+  _REGION: us-central1
+  _AR_REPO: cloud-run-source-deploy   # Artifact Registry Docker repo
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
