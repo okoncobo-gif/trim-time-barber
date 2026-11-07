@@ -22,9 +22,12 @@ import {
   Ticket,
   LogOut,
   KeyRound,
+  AlertTriangle,
+  MessageSquare,
+  UserCheck,
 } from 'lucide-react';
 import {
-  Appointment, AppointmentStatus, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser,
+  Appointment, AppointmentStatus, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser, SmsMessage,
 } from './types';
 import { appointmentService, ApiError } from './services/appointmentService';
 
@@ -37,6 +40,7 @@ const todayLocal = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
+const clock = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const errorMessage = (e: unknown) => (e instanceof Error ? e.message : 'Something went wrong');
 
 const fieldBase = 'w-full rounded-xl border border-black/5 bg-black/[0.02] focus:outline-none focus:ring-2 focus:ring-black/5 transition-all';
@@ -103,6 +107,7 @@ function MyBooking({ initial, onClose }: { initial: { ref: string; phone: string
     if (!confirm('Cancel this booking?')) return;
     run(() => appointmentService.cancelBooking(ref, phone));
   };
+  const confirmComing = () => run(() => appointmentService.confirmAttendance(ref, phone));
 
   return (
     <Modal title="My booking" icon={<Ticket className="w-5 h-5 text-black/40" />} onClose={onClose}>
@@ -126,6 +131,15 @@ function MyBooking({ initial, onClose }: { initial: { ref: string; phone: string
           {booking.status === 'pending' && (
             <p className="text-sm text-black/50">Your barber hasn't approved this booking yet. Check back here for confirmation.</p>
           )}
+          {booking.status !== 'cancelled' && (booking.customer_confirmed ? (
+            <p className="text-sm text-emerald-700 flex items-center gap-2"><UserCheck className="w-4 h-4" /> You've confirmed you're coming. See you soon!</p>
+          ) : booking.can_confirm_attendance ? (
+            <button onClick={confirmComing} disabled={busy} className={primaryButton}>
+              <UserCheck className="w-4 h-4" /> Yes, I'm still coming
+            </button>
+          ) : (
+            <p className="text-xs text-black/40">Within {booking.attendance_window_hours} hours of your appointment we'll text you to confirm you're still coming.</p>
+          ))}
           {booking.status !== 'cancelled' && (booking.can_cancel ? (
             <button onClick={cancel} disabled={busy} className="w-full py-3 rounded-xl font-semibold border border-red-200 text-red-600 hover:bg-red-50 transition-all">
               Cancel booking
@@ -203,6 +217,8 @@ export default function App() {
   const [showAddBarber, setShowAddBarber] = useState(false);
   const [isEditingHours, setIsEditingHours] = useState(false);
   const [barberFilter, setBarberFilter] = useState('all');
+  const [messages, setMessages] = useState<SmsMessage[]>([]);
+  const [showMessages, setShowMessages] = useState(false);
 
   const isAdmin = user?.role === 'admin';
 
@@ -217,7 +233,15 @@ export default function App() {
     if (view === 'staff' && user) {
       fetchAppointments();
       fetchBarbers();
+      if (user.role === 'admin') { fetchAdminSettings(); fetchMessages(); }
     }
+  }, [view, user]);
+
+  // Keep the staff dashboard fresh (approvals, auto-approvals, new bookings).
+  useEffect(() => {
+    if (view !== 'staff' || !user) return;
+    const timer = setInterval(() => { fetchAppointments(); if (user.role === 'admin') fetchMessages(); }, 60_000);
+    return () => clearInterval(timer);
   }, [view, user]);
 
   const fetchBarbers = async () => {
@@ -226,6 +250,14 @@ export default function App() {
 
   const fetchSettings = async () => {
     try { setSettings(await appointmentService.getSettings()); } catch (e) { console.error('Failed to fetch settings', e); }
+  };
+
+  const fetchAdminSettings = async () => {
+    try { setSettings(await appointmentService.getAdminSettings()); } catch (e) { console.error('Failed to fetch settings', e); }
+  };
+
+  const fetchMessages = async () => {
+    try { setMessages(await appointmentService.getMessages()); } catch (e) { console.error('Failed to fetch messages', e); }
   };
 
   const fetchAppointments = async () => {
@@ -246,7 +278,7 @@ export default function App() {
   const staffAction = async (fn: () => Promise<unknown>, refresh: Array<() => Promise<void>> = [fetchAppointments]) => {
     try {
       await fn();
-      await Promise.all(refresh.map(r => r()));
+      await Promise.all([...refresh, ...(isAdmin ? [fetchMessages] : [])].map(r => r()));
       return true;
     } catch (e) {
       handleStaffError(e);
@@ -276,7 +308,7 @@ export default function App() {
       customer_phone: formData.get('phone') as string,
       date: formData.get('date') as string,
       time: formData.get('time') as string,
-      barber_id: barberVal ? Number(barberVal) : null,
+      barber_id: Number(barberVal),
     };
     try {
       const booking = await appointmentService.create(newApp);
@@ -294,8 +326,12 @@ export default function App() {
   const handleUpdateStatus = (id: number, status: AppointmentStatus) =>
     staffAction(() => appointmentService.update(id, { status }));
 
-  const handleReassign = (id: number, barberVal: string) =>
-    staffAction(() => appointmentService.update(id, { barber_id: barberVal ? Number(barberVal) : null }));
+  const handleReassign = (id: number, barberVal: string) => {
+    if (!barberVal) return;
+    const name = barbers.find(b => b.id === Number(barberVal))?.name;
+    if (!confirm(`Move this booking to ${name}? ${name} will need to approve it, and the customer will get a text.`)) return;
+    staffAction(() => appointmentService.update(id, { barber_id: Number(barberVal) }));
+  };
 
   const handleDelete = (id: number) => {
     if (!confirm('Permanently delete this appointment? To keep a record, cancel it instead.')) return;
@@ -306,25 +342,33 @@ export default function App() {
     e.preventDefault();
     if (!editingAppointment) return;
     const formData = new FormData(e.currentTarget);
-    const barberVal = formData.get('barber_id') as string;
-    const ok = await staffAction(() => appointmentService.update(editingAppointment.id, {
-      customer_name: formData.get('name') as string,
-      customer_phone: formData.get('phone') as string,
+    const updates: Partial<Appointment> = {
       date: formData.get('date') as string,
       time: formData.get('time') as string,
-      barber_id: barberVal ? Number(barberVal) : null,
-    }));
+      barber_id: Number(formData.get('barber_id')),
+    };
+    if (isAdmin) {
+      updates.customer_name = formData.get('name') as string;
+      updates.customer_phone = formData.get('phone') as string;
+    }
+    const ok = await staffAction(() => appointmentService.update(editingAppointment.id, updates));
     if (ok) setEditingAppointment(null);
   };
 
   const handleUpdateOpeningHours = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const value = new FormData(e.currentTarget).get('opening_hours') as string;
-    if (await staffAction(() => appointmentService.updateSetting('opening_hours', value), [fetchSettings])) setIsEditingHours(false);
+    if (await staffAction(() => appointmentService.updateSetting('opening_hours', value), [fetchAdminSettings])) setIsEditingHours(false);
   };
 
   const handleApprovalMode = (mode: 'auto' | 'manual') =>
-    staffAction(() => appointmentService.updateSetting('approval_mode', mode), [fetchSettings]);
+    staffAction(() => appointmentService.updateSetting('approval_mode', mode), [fetchAdminSettings]);
+
+  const handleAdminPhone = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const value = new FormData(e.currentTarget).get('admin_phone') as string;
+    staffAction(() => appointmentService.updateSetting('admin_phone', value), [fetchAdminSettings]);
+  };
 
   const handleAddBarber = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -334,6 +378,7 @@ export default function App() {
       name: formData.get('name') as string,
       specialty: formData.get('specialty') as string,
       password: (formData.get('password') as string) || undefined,
+      phone: (formData.get('phone') as string) || undefined,
     }), [fetchBarbers]);
     if (ok) { setShowAddBarber(false); form.reset(); }
   };
@@ -346,6 +391,7 @@ export default function App() {
       name: formData.get('name') as string,
       specialty: formData.get('specialty') as string,
       password: (formData.get('password') as string) || undefined,
+      phone: formData.get('phone') as string,
     }), [fetchBarbers, fetchAppointments]);
     if (ok) setEditingBarber(null);
   };
@@ -373,6 +419,7 @@ export default function App() {
     : barberFilter === 'unassigned' ? appointments.filter(a => a.barber_id === null)
     : appointments.filter(a => a.barber_id === Number(barberFilter));
   const pendingCount = appointments.filter(a => a.status === 'pending').length;
+  const urgent = appointments.filter(a => a.needs_approval_soon);
   const upcomingForRemoval = removingBarber
     ? appointments.filter(a => a.barber_id === removingBarber.id && a.status !== 'cancelled' && a.date >= todayLocal()).length
     : 0;
@@ -466,7 +513,7 @@ export default function App() {
                     <p className="text-sm text-black/50">
                       {lastBooking.booking.status === 'confirmed'
                         ? 'Your appointment is confirmed.'
-                        : 'Your barber will review your request. Use "My Booking" with this code to check when it’s confirmed.'}
+                        : 'Your barber will review your request and we’ll text you when it’s confirmed. You can also check under "My Booking" with this code.'}
                       {' '}You can cancel online up to {lastBooking.booking.cancel_cutoff_hours} hours before. Keep this code.
                     </p>
                     <div className="flex gap-3">
@@ -503,8 +550,8 @@ export default function App() {
                           <label className={labelClass}>Select Barber</label>
                           <div className="relative">
                             <Scissors className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
-                            <select name="barber_id" className={`${fieldBase} pl-12 pr-4 py-4 appearance-none`}>
-                              <option value="">No preference</option>
+                            <select name="barber_id" required defaultValue="" className={`${fieldBase} pl-12 pr-4 py-4 appearance-none`}>
+                              <option value="" disabled>Choose your barber</option>
                               {barbers.map(b => <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>)}
                             </select>
                           </div>
@@ -525,8 +572,8 @@ export default function App() {
                       </div>
 
                       <p className="text-xs text-black/40">
-                        Book at least {settings.min_lead_hours || 1} hour ahead.
-                        {settings.approval_mode !== 'auto' && ' Your barber approves each booking; you can check its status under "My Booking".'}
+                        Book at least {settings.min_lead_hours || 1} hour ahead. We'll text you when your booking is confirmed,
+                        and again before your appointment to check you're still coming.
                       </p>
 
                       {bookingError && <p className="text-sm text-red-600">{bookingError}</p>}
@@ -562,6 +609,21 @@ export default function App() {
                 </div>
               </div>
 
+              {urgent.length > 0 && (
+                <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4 flex gap-3">
+                  <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="text-sm text-amber-900">
+                    <p className="font-semibold">{urgent.length} booking{urgent.length === 1 ? '' : 's'} still need{urgent.length === 1 ? 's' : ''} approval</p>
+                    <p>Unapproved bookings are approved automatically {settings.approval_deadline_hours || 1} hour before the appointment.</p>
+                    <ul className="mt-1 list-disc pl-5">
+                      {urgent.map(a => (
+                        <li key={a.id}>{a.customer_name}, {a.date} at {slotLabel(a.time)}{isAdmin && a.barber_name ? ` (${a.barber_name})` : ''}: auto-approves at {clock(a.auto_approve_at)}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
+
               {isAdmin && (
                 <>
                   {/* Shop settings */}
@@ -587,9 +649,17 @@ export default function App() {
                       <p className="text-sm text-black/40">
                         {settings.approval_mode === 'auto'
                           ? 'New bookings are confirmed immediately.'
-                          : 'New bookings wait for the barber (or admin) to approve them.'}
+                          : `New bookings wait for the barber (or admin) to approve them. Anything not approved is approved automatically ${settings.approval_deadline_hours || 1} hour before; the barber and admin get a warning ${settings.approval_warning_hours || 3} hours before.`}
                       </p>
                     </div>
+
+                    <form onSubmit={handleAdminPhone} className="space-y-2">
+                      <label className={labelClass}>Admin mobile (for SMS warnings)</label>
+                      <div className="flex gap-2">
+                        <input key={settings.admin_phone} name="admin_phone" type="tel" defaultValue={settings.admin_phone} placeholder="(555) 000-0000" className={`${inputClass} flex-1`} />
+                        <button type="submit" className="px-6 py-3 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all">Save</button>
+                      </div>
+                    </form>
 
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
@@ -633,7 +703,7 @@ export default function App() {
                         <motion.form
                           initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
                           onSubmit={handleAddBarber}
-                          className="grid md:grid-cols-4 gap-3 items-end p-4 rounded-xl bg-black/[0.02] border border-black/5"
+                          className="grid md:grid-cols-5 gap-3 items-end p-4 rounded-xl bg-black/[0.02] border border-black/5"
                         >
                           <div className="space-y-1">
                             <label className={labelClass}>Name</label>
@@ -642,6 +712,10 @@ export default function App() {
                           <div className="space-y-1">
                             <label className={labelClass}>Specialty</label>
                             <input name="specialty" required placeholder="e.g. Fades & Tapers" className={`w-full rounded-xl border border-black/5 bg-white px-4 py-3 focus:outline-none focus:ring-2 focus:ring-black/5`} />
+                          </div>
+                          <div className="space-y-1">
+                            <label className={labelClass}>Mobile (SMS)</label>
+                            <input name="phone" type="tel" placeholder="Optional" className="w-full rounded-xl border border-black/5 bg-white px-4 py-3 focus:outline-none focus:ring-2 focus:ring-black/5" />
                           </div>
                           <div className="space-y-1">
                             <label className={labelClass}>Login password</label>
@@ -661,6 +735,7 @@ export default function App() {
                             <p className="font-semibold">{barber.name}</p>
                             <p className="text-sm text-black/40">
                               {barber.specialty} · {barber.has_login ? 'Can sign in' : <span className="text-amber-700">No login yet — set a password</span>}
+                              {' · '}{barber.phone ? barber.phone : <span className="text-amber-700">No mobile for SMS</span>}
                             </p>
                           </div>
                           <div className="flex items-center gap-2">
@@ -676,9 +751,41 @@ export default function App() {
                     <label className={labelClass}>Show</label>
                     <select value={barberFilter} onChange={e => setBarberFilter(e.target.value)} className="px-4 py-2 rounded-xl border border-black/10 bg-white text-sm">
                       <option value="all">All barbers</option>
-                      <option value="unassigned">Unassigned</option>
+                      {appointments.some(a => a.barber_id === null) && <option value="unassigned">Unassigned</option>}
                       {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
                     </select>
+                  </div>
+
+                  {/* SMS log */}
+                  <div className="glass-card rounded-2xl p-6 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <MessageSquare className="w-5 h-5 text-black/40" />
+                        <h2 className="text-xl font-serif">Text Messages</h2>
+                      </div>
+                      <button onClick={() => setShowMessages(v => !v)} className="text-sm font-semibold px-4 py-2 rounded-full border border-black/10 hover:bg-black hover:text-white transition-colors">
+                        {showMessages ? 'Hide' : `Show latest (${messages.length})`}
+                      </button>
+                    </div>
+                    {messages.some(m => m.status === 'not_sent') && (
+                      <p className="text-sm text-amber-700">SMS isn't connected yet. Messages are logged here but not delivered.</p>
+                    )}
+                    {showMessages && (
+                      <div className="divide-y divide-black/5 max-h-96 overflow-y-auto">
+                        {messages.length === 0 ? <p className="text-sm text-black/30 italic py-2">No messages yet.</p> : messages.map(m => (
+                          <div key={m.id} className="py-3 text-sm">
+                            <div className="flex justify-between gap-4 text-xs text-black/40">
+                              <span>{new Date(m.created_at.replace(' ', 'T') + 'Z').toLocaleString()} · to {m.to_role} {m.to_phone}</span>
+                              <span className={m.status === 'sent' ? 'text-emerald-700' : m.status === 'failed' ? 'text-red-600' : 'text-black/40'}>
+                                {m.status === 'not_sent' ? 'not sent' : m.status}
+                              </span>
+                            </div>
+                            <p className="mt-1">{m.body}</p>
+                            {m.status === 'failed' && m.error && <p className="text-xs text-red-600 mt-1">{m.error}</p>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </>
               )}
@@ -711,8 +818,9 @@ export default function App() {
                               onChange={e => handleReassign(app.id, e.target.value)}
                               className="px-2 py-1 rounded-lg border border-black/10 bg-white text-sm font-medium"
                               title="Reassign"
+                              disabled={app.status === 'cancelled'}
                             >
-                              <option value="">Unassigned</option>
+                              {app.barber_id === null && <option value="">Unassigned</option>}
                               {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
                             </select>
                           ) : (
@@ -734,6 +842,17 @@ export default function App() {
                           {app.status === 'cancelled' && app.cancelled_by && (
                             <p className="text-[10px] text-black/30">by {app.cancelled_by}</p>
                           )}
+                          {app.status === 'pending' && !app.is_past && (
+                            <p className={`text-[10px] ${app.needs_approval_soon ? 'text-amber-700 font-semibold' : 'text-black/30'}`}>auto-approves {clock(app.auto_approve_at)}</p>
+                          )}
+                          {app.status === 'confirmed' && app.approved_by === 'deadline' && (
+                            <p className="text-[10px] text-black/30">approved automatically</p>
+                          )}
+                          {app.status === 'confirmed' && !app.is_past && (
+                            <p className={`text-[10px] ${app.customer_confirmed_at ? 'text-emerald-700' : 'text-black/30'}`}>
+                              {app.customer_confirmed_at ? 'customer confirmed ✓' : 'customer not confirmed yet'}
+                            </p>
+                          )}
                         </div>
 
                         <div className="flex items-center gap-2">
@@ -747,11 +866,13 @@ export default function App() {
                               <X className="w-5 h-5" />
                             </button>
                           )}
+                          {app.status !== 'cancelled' && (
+                            <button onClick={() => setEditingAppointment(app)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title={isAdmin ? 'Edit' : 'Reschedule or move to another barber'}>
+                              <Pencil className="w-5 h-5" />
+                            </button>
+                          )}
                           {isAdmin && (
                             <>
-                              <button onClick={() => setEditingAppointment(app)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Edit">
-                                <Pencil className="w-5 h-5" />
-                              </button>
                               <button onClick={() => handleDelete(app.id)} className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black transition-colors" title="Delete">
                                 <Trash2 className="w-5 h-5" />
                               </button>
@@ -795,6 +916,10 @@ export default function App() {
                   <input name="specialty" required defaultValue={editingBarber.specialty} className={inputClass} />
                 </div>
                 <div className="space-y-2">
+                  <label className={labelClass}>Mobile (for SMS)</label>
+                  <input name="phone" type="tel" defaultValue={editingBarber.phone ?? ''} placeholder="Optional" className={inputClass} />
+                </div>
+                <div className="space-y-2">
                   <label className={`${labelClass} flex items-center gap-1`}><KeyRound className="w-3 h-3" /> {editingBarber.has_login ? 'Reset login password' : 'Set login password'}</label>
                   <input name="password" type="password" minLength={4} placeholder={editingBarber.has_login ? 'Leave blank to keep current' : 'At least 4 characters'} className={inputClass} />
                 </div>
@@ -822,16 +947,22 @@ export default function App() {
         {/* Edit Appointment Modal (admin) */}
         <AnimatePresence>
           {editingAppointment && (
-            <Modal title="Edit Appointment" onClose={() => setEditingAppointment(null)} wide>
+            <Modal title={isAdmin ? 'Edit Appointment' : 'Reschedule / Move'} onClose={() => setEditingAppointment(null)} wide>
               <form onSubmit={handleSaveEdit} className="space-y-6">
-                <div className="space-y-2">
-                  <label className={labelClass}>Full Name</label>
-                  <input name="name" required defaultValue={editingAppointment.customer_name} className={inputClass} />
-                </div>
-                <div className="space-y-2">
-                  <label className={labelClass}>Phone Number</label>
-                  <input name="phone" required type="tel" defaultValue={editingAppointment.customer_phone} className={inputClass} />
-                </div>
+                {isAdmin ? (
+                  <>
+                    <div className="space-y-2">
+                      <label className={labelClass}>Full Name</label>
+                      <input name="name" required defaultValue={editingAppointment.customer_name} className={inputClass} />
+                    </div>
+                    <div className="space-y-2">
+                      <label className={labelClass}>Phone Number</label>
+                      <input name="phone" required type="tel" defaultValue={editingAppointment.customer_phone} className={inputClass} />
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm text-black/50">{editingAppointment.customer_name} · {editingAppointment.customer_phone}</p>
+                )}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <label className={labelClass}>Date</label>
@@ -845,11 +976,12 @@ export default function App() {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <label className={labelClass}>Assign Barber</label>
-                  <select name="barber_id" defaultValue={editingAppointment.barber_id ?? ''} className={`${inputClass} appearance-none`}>
-                    <option value="">Unassigned</option>
+                  <label className={labelClass}>Barber</label>
+                  <select name="barber_id" required defaultValue={editingAppointment.barber_id ?? ''} className={`${inputClass} appearance-none`}>
+                    {editingAppointment.barber_id === null && <option value="" disabled>Choose a barber</option>}
                     {barbers.map(b => <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>)}
                   </select>
+                  <p className="text-xs text-black/40">The customer gets a text about any change. Moving to another barber means they have to approve it.</p>
                 </div>
                 <button type="submit" className={primaryButton}><Save className="w-4 h-4" /> Save Changes</button>
               </form>
@@ -872,7 +1004,7 @@ export default function App() {
 }
 
 function RemovalOptions({ barbers }: { barbers: Barber[] }) {
-  const [action, setAction] = useState<BarberRemovalAction>(barbers.length ? 'reassign' : 'unassign');
+  const [action, setAction] = useState<BarberRemovalAction>(barbers.length ? 'reassign' : 'cancel');
   const option = (value: BarberRemovalAction, label: string, disabled = false) => (
     <label className={`flex items-center gap-3 p-3 rounded-xl border ${action === value ? 'border-black/30 bg-black/[0.03]' : 'border-black/5'} ${disabled ? 'opacity-40' : 'cursor-pointer'}`}>
       <input type="radio" name="action" value={value} checked={action === value} disabled={disabled} onChange={() => setAction(value)} />
@@ -881,14 +1013,13 @@ function RemovalOptions({ barbers }: { barbers: Barber[] }) {
   );
   return (
     <div className="space-y-2">
-      {option('reassign', 'Move them to another barber', barbers.length === 0)}
+      {option('reassign', 'Move them to another barber (they approve; customers get a text)', barbers.length === 0)}
       {action === 'reassign' && (
         <select name="reassign_to" required className={`${inputClass} appearance-none`}>
           {barbers.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
         </select>
       )}
-      {option('unassign', 'Keep them, unassigned (admin assigns later)')}
-      {option('cancel', 'Cancel them')}
+      {option('cancel', 'Cancel them (customers get a text)')}
     </div>
   );
 }

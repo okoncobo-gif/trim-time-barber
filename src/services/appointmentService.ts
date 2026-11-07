@@ -1,5 +1,5 @@
 import {
-  Appointment, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser,
+  Appointment, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser, SmsMessage,
 } from '../types';
 
 // Staff session token, kept for the browser tab only.
@@ -47,6 +47,7 @@ export const appointmentService = {
   create: (appointment: NewAppointment) => api<CustomerBooking>('POST', '/api/appointments', appointment),
   lookup: (ref: string, phone: string) => api<CustomerBooking>('POST', '/api/bookings/lookup', { ref, phone }),
   cancelBooking: (ref: string, phone: string) => api<CustomerBooking>('POST', '/api/bookings/cancel', { ref, phone }),
+  confirmAttendance: (ref: string, phone: string) => api<CustomerBooking>('POST', '/api/bookings/confirm', { ref, phone }),
 
   // Staff
   getAll: () => api<Appointment[]>('GET', '/api/appointments'),
@@ -55,13 +56,15 @@ export const appointmentService = {
 
   // Settings
   getSettings: () => api<Record<string, string>>('GET', '/api/settings'),
+  getAdminSettings: () => api<Record<string, string>>('GET', '/api/settings/admin'),
+  getMessages: () => api<SmsMessage[]>('GET', '/api/messages'),
   updateSetting: (key: string, value: string) => api<void>('POST', '/api/settings', { key, value }),
 
   // Barbers
   getBarbers: () => api<Barber[]>('GET', '/api/barbers'),
-  createBarber: (barber: { name: string; specialty: string; password?: string }) =>
+  createBarber: (barber: { name: string; specialty: string; password?: string; phone?: string }) =>
     api<{ id: number }>('POST', '/api/barbers', barber),
-  updateBarber: (id: number, updates: { name?: string; specialty?: string; password?: string }) =>
+  updateBarber: (id: number, updates: { name?: string; specialty?: string; password?: string; phone?: string }) =>
     api<void>('PATCH', `/api/barbers/${id}`, updates),
   deleteBarber: (id: number, action: BarberRemovalAction, reassign_to?: number) =>
     api<{ upcoming_affected: number }>('DELETE', `/api/barbers/${id}`, { action, reassign_to }),
