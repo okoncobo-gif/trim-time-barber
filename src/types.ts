@@ -4,6 +4,36 @@ export interface Barber {
   specialty: string;
   has_login?: boolean;   // only returned to the admin
   phone?: string | null; // only returned to the admin
+  max_days_ahead: number;
+  accepts_premium: boolean;
+}
+
+export type DayHours = { start: string; end: string } | null;
+export type WeeklySchedule = Record<string, DayHours>; // '0' = Sunday … '6' = Saturday
+
+export interface TimeOff {
+  id: number;
+  barber_id: number;
+  start_date: string;
+  end_date: string;
+  note: string | null;
+}
+
+export interface BarberAvailability {
+  barber_id: number;
+  schedule: WeeklySchedule;
+  max_days_ahead: number;
+  accepts_premium: boolean;
+  time_off: TimeOff[];
+  clashing_bookings?: number;
+}
+
+export interface DaySlots {
+  date: string;
+  max_date: string;
+  premium_fee: string;
+  slots: { time: string; kind: 'normal' | 'premium' }[];
+  message?: string;
 }
 
 export type AppointmentStatus = 'pending' | 'confirmed' | 'cancelled';
@@ -21,6 +51,8 @@ export interface Appointment {
   cancelled_by?: 'customer' | 'barber' | 'admin' | null;
   approved_by?: 'barber' | 'admin' | 'auto' | 'deadline' | null;
   customer_confirmed_at?: string | null;
+  premium?: number;
+  premium_fee?: string | null;
   created_at: string;
   // computed by the server for the dashboard
   start_at: string;
@@ -46,6 +78,7 @@ export interface NewAppointment {
   date: string;
   time: string;
   barber_id: number;
+  premium_ack?: boolean;
 }
 
 // What a customer sees about their own booking.
@@ -60,6 +93,9 @@ export interface CustomerBooking {
   cancel_cutoff_hours: number;
   customer_confirmed: boolean;
   can_confirm_attendance: boolean;
+  premium: boolean;
+  premium_fee: string | null;
+  barber_phone: string | null;
   attendance_window_hours: number;
 }
 

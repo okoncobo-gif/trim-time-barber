@@ -1,5 +1,6 @@
 import {
-  Appointment, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser, SmsMessage,
+  Appointment, Barber, BarberAvailability, BarberRemovalAction, CustomerBooking, DaySlots, NewAppointment,
+  SessionUser, SmsMessage,
 } from '../types';
 
 // Staff session token, kept for the browser tab only.
@@ -48,6 +49,17 @@ export const appointmentService = {
   lookup: (ref: string, phone: string) => api<CustomerBooking>('POST', '/api/bookings/lookup', { ref, phone }),
   cancelBooking: (ref: string, phone: string) => api<CustomerBooking>('POST', '/api/bookings/cancel', { ref, phone }),
   confirmAttendance: (ref: string, phone: string) => api<CustomerBooking>('POST', '/api/bookings/confirm', { ref, phone }),
+
+  getAvailability: (barberId: number, date: string) =>
+    api<DaySlots>('GET', `/api/availability?barber_id=${barberId}&date=${encodeURIComponent(date)}`),
+
+  // Barber availability (barber: own; admin: anyone)
+  getBarberAvailability: (id: number) => api<BarberAvailability>('GET', `/api/barbers/${id}/availability`),
+  updateBarberAvailability: (id: number, updates: Partial<Pick<BarberAvailability, 'schedule' | 'max_days_ahead' | 'accepts_premium'>>) =>
+    api<BarberAvailability>('PUT', `/api/barbers/${id}/availability`, updates),
+  addTimeOff: (id: number, start_date: string, end_date: string, note: string) =>
+    api<BarberAvailability>('POST', `/api/barbers/${id}/time-off`, { start_date, end_date, note }),
+  removeTimeOff: (id: number, timeOffId: number) => api<BarberAvailability>('DELETE', `/api/barbers/${id}/time-off/${timeOffId}`),
 
   // Staff
   getAll: () => api<Appointment[]>('GET', '/api/appointments'),

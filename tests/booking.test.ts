@@ -48,7 +48,7 @@ test("manual approval leaves bookings pending; auto confirms them; SMS queued", 
   assert.equal(book(db).status, "pending");
   assert.equal(msgs(db, "received").length, 1);
   b.updateSetting(db, admin, "approval_mode", "auto");
-  assert.equal(book(db).status, "confirmed");
+  assert.equal(book(db, { time: "15:00" }).status, "confirmed");
   assert.equal(msgs(db, "confirmed")[0].to_phone, "+15551234567");
   expectHttp(() => b.updateSetting(db, admin, "approval_mode", "sometimes"), 400);
 });
@@ -170,11 +170,11 @@ test("SMS delivery: logged as not_sent without Twilio; sent/failed with a sender
   book(db);
   await b.deliverQueued(db, null);
   assert.equal(msgs(db)[0].status, "not_sent");
-  book(db);
+  book(db, { time: "15:00" });
   const sent: string[] = [];
   await b.deliverQueued(db, async (to) => { sent.push(to); });
   assert.deepEqual(sent, ["+15551234567"]);
-  book(db);
+  book(db, { time: "16:00" });
   await b.deliverQueued(db, async () => { throw new Error("boom"); });
   assert.equal(msgs(db)[0].status, "failed");
   assert.equal(b.toE164("+44 20 7946 0958"), "+442079460958");
@@ -216,4 +216,97 @@ test("input validation and existing databases get new columns", () => {
     INSERT INTO appointments (customer_name, customer_phone, date, time) VALUES ('Old', '5551112222', '2026-12-01', '10:00');`);
   b.initDb(old);
   assert.match(b.listAppointments(old, admin, NOW)[0].ref, /^[A-Z2-9]{6}$/);
+});
+
+test("availability: weekly hours, days off, time off, booking horizon, no double-booking", () => {
+  const db = setup();
+  // Default: Tue–Sat 9–7. 2026-11-15 is a Sunday.
+  const sun = b.getAvailability(db, 1, "2026-11-15", NOW);
+  assert.equal(sun.slots.length, 0);
+  assert.match(sun.message, /doesn't work that day/);
+  expectHttp(() => book(db, { date: "2026-11-15" }), 400);
+
+  const wed = b.getAvailability(db, 1, "2026-11-11", NOW);
+  assert.deepEqual(wed.slots.map((x: any) => x.time), ["09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00"]);
+  book(db, { time: "14:00" });
+  assert.equal(b.getAvailability(db, 1, "2026-11-11", NOW).slots.some((x: any) => x.time === "14:00"), false);
+  expectHttp(() => book(db, { time: "14:00", customer_phone: "5559998888" }), 409);
+  assert.ok(book(db, { time: "14:00", barber_id: 2 })); // other barber is free
+
+  // Today: slots under 1h lead are hidden (now = 10:00).
+  assert.equal(b.getAvailability(db, 1, "2026-11-10", NOW).slots[0].time, "11:00");
+
+  // Barber changes own hours and horizon; can't change someone else's.
+  b.updateBarberAvailability(db, marcus, 1, { schedule: { ...b.DEFAULT_SCHEDULE, "0": { start: "10:00", end: "14:00" } }, max_days_ahead: 7 });
+  assert.equal(b.getAvailability(db, 1, "2026-11-15", NOW).slots.length, 4);
+  expectHttp(() => b.updateBarberAvailability(db, marcus, 2, { max_days_ahead: 7 }), 403);
+  expectHttp(() => b.updateBarberAvailability(db, marcus, 1, { max_days_ahead: 0 }), 400);
+  expectHttp(() => b.updateBarberAvailability(db, marcus, 1, { schedule: { "2": { start: "15:00", end: "10:00" } } }), 400);
+  assert.match(b.getAvailability(db, 1, "2026-11-18", NOW).message, /up to 7 days ahead/);
+  expectHttp(() => book(db, { date: "2026-11-18" }), 400);
+
+  // Time off blocks the day and reports clashing bookings.
+  const r = b.addTimeOff(db, marcus, 1, { start_date: "2026-11-11", end_date: "2026-11-12", note: "Vacation" });
+  assert.equal(r.clashing_bookings, 1);
+  assert.match(b.getAvailability(db, 1, "2026-11-11", NOW).message, /off that day/);
+  b.removeTimeOff(db, admin, 1, r.time_off[0].id);
+  assert.ok(b.getAvailability(db, 1, "2026-11-11", NOW).slots.length > 0);
+  assert.equal(b.listBarbers(db, null).find((x: any) => x.id === 1).max_days_ahead, 7);
+});
+
+test("premium requests: opt-in, outside hours, fee acknowledged, never auto-approved", () => {
+  const db = setup();
+  assert.equal(b.getAvailability(db, 1, "2026-11-11", NOW).slots.some((x: any) => x.kind === "premium"), false);
+  expectHttp(() => book(db, { time: "19:00" }), 400); // not opted in
+
+  b.updateBarberAvailability(db, marcus, 1, { accepts_premium: true });
+  b.updateSetting(db, admin, "premium_fee", "30");
+  expectHttp(() => b.updateSetting(db, admin, "premium_fee", "lots"), 400);
+  const slots = b.getAvailability(db, 1, "2026-11-11", NOW).slots;
+  assert.deepEqual(slots.filter((x: any) => x.kind === "premium").map((x: any) => x.time), ["07:00", "08:00", "19:00", "20:00"]);
+  assert.equal(b.getAvailability(db, 1, "2026-11-15", NOW).slots.length, 0); // not on days off
+
+  expectHttp(() => book(db, { time: "19:00" }), 400); // fee not acknowledged
+  b.updateSetting(db, admin, "approval_mode", "auto");
+  const p = book(db, { time: "19:00", premium_ack: true });
+  assert.equal(p.status, "pending"); // even in auto mode
+  assert.equal(p.premium, true);
+  assert.equal(p.premium_fee, "30");
+  assert.match(msgs(db, "received")[0].body, /premium request.*\+\$30/i);
+
+  // At the deadline a premium request stays pending and the customer is nudged once.
+  b.updateBarber(db, admin, 1, { phone: "555-777-0001" });
+  const in59 = Date.UTC(2026, 10, 12, 0, 1); // Wed 18:01 local, 59 min before 19:00
+  const r = b.runDueJobs(db, in59);
+  assert.equal(r.auto_approved, 0);
+  assert.equal(r.nudged, 1);
+  assert.equal(b.runDueJobs(db, in59).nudged, 0);
+  assert.equal(b.lookupAppointment(db, p.ref, "5551234567", in59).status, "pending");
+  assert.match(msgs(db, "text_your_barber")[0].body, /text Marcus directly at 555-777-0001/);
+});
+
+test("text-your-barber: normal booking auto-approved at the deadline nudges customer; barber contact in texts", () => {
+  const db = setup();
+  b.updateBarber(db, admin, 1, { phone: "555-777-0001" });
+  const app = book(db, { date: "2026-11-10", time: "18:00" });
+  assert.match(msgs(db, "received")[0].body, /Your barber: Marcus, 555-777-0001/);
+  const in59 = Date.UTC(2026, 10, 10, 23, 1);
+  const r = b.runDueJobs(db, in59);
+  assert.deepEqual([r.auto_approved, r.nudged], [1, 1]);
+  assert.equal(b.lookupAppointment(db, app.ref, "5551234567", in59).status, "confirmed");
+  assert.match(msgs(db, "text_your_barber")[0].body, /hasn't confirmed personally — please text Marcus directly at 555-777-0001/);
+
+  // Barber confirmed in time → no nudge.
+  const app2 = book(db, { date: "2026-11-10", time: "17:00" });
+  b.updateAppointment(db, marcus, idOf(db, app2.ref), { status: "confirmed" }, NOW);
+  assert.equal(b.runDueJobs(db, Date.UTC(2026, 10, 10, 22, 1)).nudged, 0);
+  assert.match(msgs(db, "confirmed")[0].body, /Your barber: Marcus/);
+});
+
+test("staff moves respect double-booking", () => {
+  const db = setup();
+  book(db, { time: "14:00", barber_id: 2 });
+  const mine = book(db, { time: "14:00", barber_id: 1 });
+  expectHttp(() => b.updateAppointment(db, marcus, idOf(db, mine.ref), { barber_id: 2 }, NOW), 409);
+  expectHttp(() => b.updateAppointment(db, admin, idOf(db, mine.ref), { time: "14:00", barber_id: 2 }, NOW), 409);
 });
