@@ -28,7 +28,7 @@ Admin password is still `admin` by owner decision. Hardening is deferred (TT-019
 | Approval warning | sent to the barber and the admin 3 hours before, if the booking is still unapproved | Owner Q6, Q8 |
 | Attendance confirmation | customer confirms they're still coming within 24h of the appointment (SMS reminder) | Owner Q1, Q8 (TT-023) |
 | Customer doesn't confirm attendance | nothing happens; staff see "customer not confirmed yet" | Owner Q7 |
-| Moving a booking to another barber | the new barber must approve it; the customer is texted | Owner Q5 (TT-025) |
+| Moving a booking to another barber | if already approved: stays approved; customer texted "moved to <new barber>"; new barber texted about the new customer. If still awaiting approval: the new barber must approve it | Owner Q5, refined in testing (TT-039; change not built yet) |
 | Rescheduling by a barber | the new time stays confirmed; the customer is texted and can cancel and rebook if it doesn't suit them | Owner Q9 |
 | Removing a barber | their upcoming bookings are moved to another barber (who approves them) or cancelled | Owner Q3 |
 | Slots | hourly start times; normal = inside the barber's weekly hours | Owner (TT-030) |
@@ -36,7 +36,7 @@ Admin password is still `admin` by owner decision. Hardening is deferred (TT-019
 | Booking window | set per barber; default 30 days ahead | Owner (TT-031); default is an assumption (Q11) |
 | Time off | set per barber; blocks new bookings; existing bookings are flagged, not cancelled | Assumption (TT-032, Q14) |
 | Double-booking | a barber can't have two active bookings at the same time | TT-004 |
-| Premium requests | early/late slots (7–9 AM, 7–9 PM) on working days, for barbers who opt in; flat fee set by the admin (default $25), paid at the shop; customer accepts the fee; never auto-approved | Owner (TT-033); window, fee and payment are assumptions (Q10, Q12, Q13, Q15) |
+| Premium requests | early/late slots (7–9 AM, 7–9 PM) on working days, and on Sundays (TT-037; change not built yet), for barbers who opt in; flat fee set by the admin (default $25), paid at the shop; customer accepts the fee; never auto-approved | Owner (TT-033); window, fee and payment are assumptions (Q10, Q13, Q15); Sundays allowed (Q12) |
 | Barber hasn't confirmed by 1h before | normal booking: auto-approved, customer asked to text the barber; premium request: stays pending, customer asked to text the barber | Owner (TT-034, Q6) |
 
 ## Notifications (SMS — owner Q2)
@@ -58,7 +58,7 @@ Admin password is still `admin` by owner decision. Hardening is deferred (TT-019
 ## Open decisions
 - **Q10:** premium hours window.
 - **Q11:** default booking window.
-- **Q12:** premium requests on days off?
+- **TT-037 details:** on Sundays, are all hours in the premium window (7 AM–9 PM) bookable? Do Mondays stay closed?
 - **Q13:** premium fee amount, and flat vs per barber.
 - **Q14:** what to do with bookings that clash with time off.
 - **Q15:** take the premium fee online?
@@ -69,10 +69,13 @@ Admin password is still `admin` by owner decision. Hardening is deferred (TT-019
 - **TT-028:** a Cloud Scheduler job so warnings and reminders fire with no site traffic.
 - **TT-019:** stronger admin login.
 
+## Testing findings
+Defects and change requests from owner testing are logged in the tracker (TT-036 onward, Type = Defect or Change request) and will be fixed together in a planned release.
+
 ## Change history
 | Date | Change | PR |
 |---|---|---|
 | 2026-11-07 | Auto-deploy from GitHub to Cloud Run | #1 |
 | 2026-11-07 | Booking code + My Booking; cancel ≥2h; 1h lead time; approval mode; barber and admin roles; reassign; API access control | #2 |
 | 2026-11-07 | Attendance confirmation; SMS; barber required; barber reschedule/move; auto-approve 1h before + 3h warnings | #3 |
-| 2026-11-07 | Barber availability (hours, booking window, time off); open-slot booking; no double-booking; premium requests; text-your-barber reminder | #4 (in review) |
+| 2026-11-07 | Barber availability (hours, booking window, time off); open-slot booking; no double-booking; premium requests; text-your-barber reminder | #4 |
