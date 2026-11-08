@@ -27,19 +27,19 @@ import {
   UserCheck,
 } from 'lucide-react';
 import {
-  Appointment, AppointmentStatus, Barber, BarberRemovalAction, CustomerBooking, NewAppointment, SessionUser, SmsMessage,
+  Appointment, AppointmentStatus, Barber, BarberRemovalAction, CustomerBooking, DaySlots, NewAppointment, SessionUser, SmsMessage,
 } from './types';
 import { appointmentService, ApiError } from './services/appointmentService';
+import { AvailabilityEditor } from './components/AvailabilityEditor';
 
-const TIME_SLOTS = ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00'];
+const TIME_SLOTS = ['07:00', '08:00', '09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00'];
 const slotLabel = (t: string) => {
   const h = Number(t.slice(0, 2));
   return `${String(h % 12 || 12).padStart(2, '0')}:${t.slice(3)} ${h < 12 ? 'AM' : 'PM'}`;
 };
-const todayLocal = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-};
+const isoDate = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const todayLocal = () => isoDate(new Date());
+const daysFromToday = (n: number) => { const d = new Date(); d.setDate(d.getDate() + n); return isoDate(d); };
 const clock = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const errorMessage = (e: unknown) => (e instanceof Error ? e.message : 'Something went wrong');
 
@@ -127,7 +127,10 @@ function MyBooking({ initial, onClose }: { initial: { ref: string; phone: string
             <StatusBadge status={booking.status} />
           </div>
           <p className="text-sm flex items-center gap-2"><CalendarDays className="w-4 h-4 text-black/40" /> {booking.date} at {slotLabel(booking.time)}</p>
-          <p className="text-sm flex items-center gap-2"><Scissors className="w-4 h-4 text-black/40" /> {booking.barber_name || 'Any available barber'}</p>
+          <p className="text-sm flex items-center gap-2"><Scissors className="w-4 h-4 text-black/40" /> {booking.barber_name || 'Barber to be assigned'}
+            {booking.barber_phone && <a href={`sms:${booking.barber_phone}`} className="underline text-black/60">· text {booking.barber_phone}</a>}
+          </p>
+          {booking.premium && <p className="text-sm text-violet-700">Premium request · +${booking.premium_fee}, paid at the shop</p>}
           {booking.status === 'pending' && (
             <p className="text-sm text-black/50">Your barber hasn't approved this booking yet. Check back here for confirmation.</p>
           )}
@@ -205,6 +208,11 @@ export default function App() {
 
   // customer
   const [bookingStatus, setBookingStatus] = useState<'idle' | 'submitting'>('idle');
+  const [formBarber, setFormBarber] = useState('');
+  const [formDate, setFormDate] = useState('');
+  const [formTime, setFormTime] = useState('');
+  const [premiumAck, setPremiumAck] = useState(false);
+  const [daySlots, setDaySlots] = useState<DaySlots | null>(null);
   const [bookingError, setBookingError] = useState('');
   const [lastBooking, setLastBooking] = useState<{ booking: CustomerBooking; phone: string } | null>(null);
   const [myBooking, setMyBooking] = useState<{ ref: string; phone: string } | null | false>(false); // false = closed
@@ -228,6 +236,15 @@ export default function App() {
     // Restore a staff session from this browser tab, if any.
     appointmentService.me().then(setUser).catch(() => appointmentService.logout());
   }, []);
+
+  // Open slots for the chosen barber and date.
+  const loadSlots = () => {
+    if (!formBarber || !formDate) { setDaySlots(null); return; }
+    appointmentService.getAvailability(Number(formBarber), formDate)
+      .then(setDaySlots)
+      .catch(e => setDaySlots({ date: formDate, max_date: '', premium_fee: '', slots: [], message: errorMessage(e) }));
+  };
+  useEffect(() => { setFormTime(''); setPremiumAck(false); loadSlots(); }, [formBarber, formDate]);
 
   useEffect(() => {
     if (view === 'staff' && user) {
@@ -302,20 +319,28 @@ export default function App() {
     setBookingStatus('submitting');
     setBookingError('');
     const formData = new FormData(form);
-    const barberVal = formData.get('barber_id') as string;
+    if (!formTime) {
+      setBookingError('Please choose a time');
+      setBookingStatus('idle');
+      return;
+    }
     const newApp: NewAppointment = {
       customer_name: formData.get('name') as string,
       customer_phone: formData.get('phone') as string,
-      date: formData.get('date') as string,
-      time: formData.get('time') as string,
-      barber_id: Number(barberVal),
+      date: formDate,
+      time: formTime,
+      barber_id: Number(formBarber),
+      premium_ack: premiumAck,
     };
     try {
       const booking = await appointmentService.create(newApp);
       setLastBooking({ booking, phone: newApp.customer_phone });
       form.reset();
+      setFormDate('');
+      setFormBarber('');
     } catch (error) {
       setBookingError(errorMessage(error));
+      loadSlots(); // a slot may have just been taken
     } finally {
       setBookingStatus('idle');
     }
@@ -363,6 +388,12 @@ export default function App() {
 
   const handleApprovalMode = (mode: 'auto' | 'manual') =>
     staffAction(() => appointmentService.updateSetting('approval_mode', mode), [fetchAdminSettings]);
+
+  const handlePremiumFee = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const value = new FormData(e.currentTarget).get('premium_fee') as string;
+    staffAction(() => appointmentService.updateSetting('premium_fee', value), [fetchAdminSettings]);
+  };
 
   const handleAdminPhone = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -516,6 +547,12 @@ export default function App() {
                         : 'Your barber will review your request and we’ll text you when it’s confirmed. You can also check under "My Booking" with this code.'}
                       {' '}You can cancel online up to {lastBooking.booking.cancel_cutoff_hours} hours before. Keep this code.
                     </p>
+                    {lastBooking.booking.premium && (
+                      <p className="text-sm text-violet-700">Premium request: +${lastBooking.booking.premium_fee}, paid at the shop. Your barber needs to accept it.</p>
+                    )}
+                    {lastBooking.booking.barber_phone && (
+                      <p className="text-sm text-black/60">Your barber: {lastBooking.booking.barber_name}, <a className="underline" href={`sms:${lastBooking.booking.barber_phone}`}>{lastBooking.booking.barber_phone}</a></p>
+                    )}
                     <div className="flex gap-3">
                       <button onClick={() => setMyBooking({ ref: lastBooking.booking.ref, phone: lastBooking.phone })} className="flex-1 py-4 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all">
                         View booking
@@ -550,7 +587,7 @@ export default function App() {
                           <label className={labelClass}>Select Barber</label>
                           <div className="relative">
                             <Scissors className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-black/20" />
-                            <select name="barber_id" required defaultValue="" className={`${fieldBase} pl-12 pr-4 py-4 appearance-none`}>
+                            <select name="barber_id" required value={formBarber} onChange={e => setFormBarber(e.target.value)} className={`${fieldBase} pl-12 pr-4 py-4 appearance-none`}>
                               <option value="" disabled>Choose your barber</option>
                               {barbers.map(b => <option key={b.id} value={b.id}>{b.name} — {b.specialty}</option>)}
                             </select>
@@ -558,18 +595,56 @@ export default function App() {
                         </div>
                       )}
 
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                          <label className={labelClass}>Date</label>
-                          <input name="date" required type="date" min={todayLocal()} className={`${fieldBase} px-4 py-4`} />
-                        </div>
-                        <div className="space-y-2">
-                          <label className={labelClass}>Time</label>
-                          <select name="time" required className={`${fieldBase} px-4 py-4 appearance-none`}>
-                            {TIME_SLOTS.map(t => <option key={t} value={t}>{slotLabel(t)}</option>)}
-                          </select>
-                        </div>
+                      <div className="space-y-2">
+                        <label className={labelClass}>Date</label>
+                        <input
+                          name="date" required type="date" disabled={!formBarber}
+                          min={todayLocal()}
+                          max={daysFromToday(barbers.find(b => String(b.id) === formBarber)?.max_days_ahead ?? 30)}
+                          value={formDate} onChange={e => setFormDate(e.target.value)}
+                          className={`${fieldBase} px-4 py-4 disabled:opacity-50`}
+                        />
+                        {!formBarber && <p className="text-xs text-black/40">Choose a barber first to see their available days.</p>}
                       </div>
+
+                      {daySlots && (
+                        <div className="space-y-3">
+                          <label className={labelClass}>Time</label>
+                          {daySlots.slots.length === 0 ? (
+                            <p className="text-sm text-black/50">{daySlots.message || 'No times available on this day.'}</p>
+                          ) : (
+                            <>
+                              <div className="grid grid-cols-3 gap-2">
+                                {daySlots.slots.filter(x => x.kind === 'normal').map(x => (
+                                  <button type="button" key={x.time} onClick={() => setFormTime(x.time)}
+                                    className={`py-3 rounded-xl text-sm font-semibold border transition-all ${formTime === x.time ? 'bg-black text-white border-black' : 'border-black/10 hover:bg-black/5'}`}>
+                                    {slotLabel(x.time)}
+                                  </button>
+                                ))}
+                              </div>
+                              {daySlots.slots.some(x => x.kind === 'premium') && (
+                                <div className="space-y-2">
+                                  <p className="text-xs font-semibold text-violet-700">Premium times, outside normal hours (+${daySlots.premium_fee}). Your barber has to accept.</p>
+                                  <div className="grid grid-cols-3 gap-2">
+                                    {daySlots.slots.filter(x => x.kind === 'premium').map(x => (
+                                      <button type="button" key={x.time} onClick={() => setFormTime(x.time)}
+                                        className={`py-3 rounded-xl text-sm font-semibold border transition-all ${formTime === x.time ? 'bg-violet-700 text-white border-violet-700' : 'border-violet-200 text-violet-800 hover:bg-violet-50'}`}>
+                                        {slotLabel(x.time)}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              {daySlots.slots.find(x => x.time === formTime)?.kind === 'premium' && (
+                                <label className="flex items-start gap-2 text-sm p-3 rounded-xl bg-violet-50 border border-violet-200">
+                                  <input type="checkbox" required checked={premiumAck} onChange={e => setPremiumAck(e.target.checked)} className="mt-1" />
+                                  <span>I understand this is a premium request with a <b>${daySlots.premium_fee}</b> fee, paid at the shop, and that my barber has to accept it.</span>
+                                </label>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
 
                       <p className="text-xs text-black/40">
                         Book at least {settings.min_lead_hours || 1} hour ahead. We'll text you when your booking is confirmed,
@@ -624,6 +699,10 @@ export default function App() {
                 </div>
               )}
 
+              {!isAdmin && user?.barber_id && (
+                <AvailabilityEditor barbers={barbers} ownBarberId={user.barber_id} onError={handleStaffError} />
+              )}
+
               {isAdmin && (
                 <>
                   {/* Shop settings */}
@@ -659,6 +738,16 @@ export default function App() {
                         <input key={settings.admin_phone} name="admin_phone" type="tel" defaultValue={settings.admin_phone} placeholder="(555) 000-0000" className={`${inputClass} flex-1`} />
                         <button type="submit" className="px-6 py-3 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all">Save</button>
                       </div>
+                    </form>
+
+                    <form onSubmit={handlePremiumFee} className="space-y-2">
+                      <label className={labelClass}>Premium request fee (USD)</label>
+                      <div className="flex gap-2 items-center">
+                        <span className="text-black/40">$</span>
+                        <input key={settings.premium_fee} name="premium_fee" inputMode="decimal" defaultValue={settings.premium_fee} className={`${inputClass} w-32`} />
+                        <button type="submit" className="px-6 py-3 rounded-xl font-semibold border border-black/10 hover:bg-black/5 transition-all">Save</button>
+                      </div>
+                      <p className="text-sm text-black/40">Charged for early or late times outside a barber's normal hours, for barbers who accept premium requests. Paid at the shop.</p>
                     </form>
 
                     <div className="space-y-2">
@@ -736,6 +825,7 @@ export default function App() {
                             <p className="text-sm text-black/40">
                               {barber.specialty} · {barber.has_login ? 'Can sign in' : <span className="text-amber-700">No login yet — set a password</span>}
                               {' · '}{barber.phone ? barber.phone : <span className="text-amber-700">No mobile for SMS</span>}
+                              {' · '}books {barber.max_days_ahead} days ahead{barber.accepts_premium ? ' · premium ✓' : ''}
                             </p>
                           </div>
                           <div className="flex items-center gap-2">
@@ -746,6 +836,8 @@ export default function App() {
                       ))}
                     </div>
                   </div>
+
+                  <AvailabilityEditor barbers={barbers} ownBarberId={null} onError={handleStaffError} />
 
                   <div className="flex items-center gap-3">
                     <label className={labelClass}>Show</label>
@@ -839,6 +931,7 @@ export default function App() {
                         <div className="space-y-1">
                           <p className="text-[10px] font-bold uppercase tracking-widest text-black/30">Status</p>
                           <StatusBadge status={app.status} />
+                          {!!app.premium && <p className="text-[10px] font-bold uppercase tracking-widest text-violet-700">Premium +${app.premium_fee}</p>}
                           {app.status === 'cancelled' && app.cancelled_by && (
                             <p className="text-[10px] text-black/30">by {app.cancelled_by}</p>
                           )}

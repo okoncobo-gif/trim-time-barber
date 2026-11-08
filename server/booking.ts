@@ -25,11 +25,22 @@ export interface SessionUser {
   name: string;
 }
 
-// Appointment slots offered to customers (shop-local time).
+// Every bookable start time (shop-local). Which ones a customer can pick
+// depends on the barber's weekly hours (normal) and the premium window.
 export const TIME_SLOTS = [
-  "09:00", "10:00", "11:00", "12:00", "13:00",
-  "14:00", "15:00", "16:00", "17:00", "18:00",
+  "07:00", "08:00", "09:00", "10:00", "11:00", "12:00", "13:00",
+  "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00",
 ];
+
+// Default weekly hours for a barber: weekday (0 = Sunday) → { start, end }
+// or null (day off). Slots start at or after `start` and before `end`.
+export type DayHours = { start: string; end: string } | null;
+export type WeeklySchedule = Record<string, DayHours>;
+const NINE_TO_SEVEN = { start: "09:00", end: "19:00" };
+export const DEFAULT_SCHEDULE: WeeklySchedule = {
+  "0": null, "1": null, "2": NINE_TO_SEVEN, "3": NINE_TO_SEVEN, "4": NINE_TO_SEVEN, "5": NINE_TO_SEVEN, "6": NINE_TO_SEVEN,
+};
+const DEFAULT_MAX_DAYS_AHEAD = 30;
 
 // Defaults for business-rule settings (stored in the settings table so they
 // can be changed without a code change).
@@ -43,15 +54,19 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   attendance_window_hours: "24",  // customers confirm they're still coming within this window
   timezone: "America/Chicago",    // shop time zone; appointment date/time are in this zone
   admin_phone: "",                // where admin SMS warnings go (optional)
+  premium_fee: "25",              // flat premium charge in USD, paid at the shop
+  premium_start: "07:00",         // premium requests can start from…
+  premium_end: "21:00",           // …until (exclusive) this time, outside the barber's normal hours
 };
 
 // Settings anyone may read.
 const PUBLIC_SETTINGS = [
   "opening_hours", "approval_mode", "cancel_cutoff_hours", "min_lead_hours",
   "approval_deadline_hours", "approval_warning_hours", "attendance_window_hours", "timezone",
+  "premium_fee", "premium_start", "premium_end",
 ];
 // Settings the admin may change from the UI.
-const EDITABLE_SETTINGS = ["opening_hours", "approval_mode", "admin_phone"];
+const EDITABLE_SETTINGS = ["opening_hours", "approval_mode", "admin_phone", "premium_fee"];
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin"; // TT-019: harden later
 const SESSION_HOURS = 12;
@@ -105,6 +120,14 @@ export function initDb(db: DB) {
       error TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS time_off (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      barber_id INTEGER NOT NULL,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      note TEXT
+    );
+
     INSERT OR IGNORE INTO barbers (id, name, specialty) VALUES
       (1, 'Marcus', 'Fades & Tapers'),
       (2, 'Devon', 'Classic Cuts'),
@@ -114,12 +137,18 @@ export function initDb(db: DB) {
   // Columns added after the first release: add them to existing databases.
   addColumnIfMissing(db, "barbers", "password_hash", "TEXT");
   addColumnIfMissing(db, "barbers", "phone", "TEXT");
+  addColumnIfMissing(db, "barbers", "schedule", "TEXT");                  // JSON WeeklySchedule; NULL = default
+  addColumnIfMissing(db, "barbers", "max_days_ahead", "INTEGER");         // NULL = default (30)
+  addColumnIfMissing(db, "barbers", "accepts_premium", "INTEGER DEFAULT 0");
   addColumnIfMissing(db, "appointments", "ref", "TEXT");
   addColumnIfMissing(db, "appointments", "cancelled_by", "TEXT");
   addColumnIfMissing(db, "appointments", "approved_by", "TEXT");          // 'barber' | 'admin' | 'auto' | 'deadline'
   addColumnIfMissing(db, "appointments", "customer_confirmed_at", "TEXT"); // customer said they're still coming
   addColumnIfMissing(db, "appointments", "reminder_sent_at", "TEXT");      // attendance reminder SMS queued
   addColumnIfMissing(db, "appointments", "warning_sent_at", "TEXT");       // 'still unapproved' warning queued
+  addColumnIfMissing(db, "appointments", "premium", "INTEGER DEFAULT 0");  // outside normal hours
+  addColumnIfMissing(db, "appointments", "premium_fee", "TEXT");           // fee quoted when booked
+  addColumnIfMissing(db, "appointments", "customer_nudged_at", "TEXT");    // 'text your barber' reminder queued
 
   for (const row of db.prepare("SELECT id FROM appointments WHERE ref IS NULL").all()) {
     db.prepare("UPDATE appointments SET ref = ? WHERE id = ?").run(newRef(db), row.id);
@@ -171,6 +200,9 @@ export function updateSetting(db: DB, user: SessionUser | null, key: string, val
   let v = value.trim();
   if (key === "approval_mode" && !["auto", "manual"].includes(v)) {
     throw new HttpError(400, "approval_mode must be 'auto' or 'manual'");
+  }
+  if (key === "premium_fee" && !/^\d+(\.\d{1,2})?$/.test(v)) {
+    throw new HttpError(400, "Premium fee must be an amount like 25 or 25.50");
   }
   if (key === "admin_phone") v = v ? cleanPhone(v) : "";
   else if (!v) throw new HttpError(400, "Value is required");
@@ -238,6 +270,12 @@ function barberOf(db: DB, id: number | null) {
   return id === null ? null : db.prepare("SELECT * FROM barbers WHERE id = ?").get(id);
 }
 
+// " Your barber: Marcus, (555) 777-0001." — included in customer texts so they can reach the barber directly.
+function barberContact(db: DB, barberId: number | null): string {
+  const b = barberOf(db, barberId);
+  return b?.phone ? ` Your barber: ${b.name}, ${b.phone}.` : "";
+}
+
 export type SmsSender = (to: string, body: string) => Promise<void>;
 
 // Sends queued messages. With no sender configured they're marked 'not_sent'
@@ -273,7 +311,7 @@ export function runDueJobs(db: DB, now = Date.now()) {
   const warnAt = num(db, "approval_warning_hours");
   const window = num(db, "attendance_window_hours");
   const adminPhone = setting(db, "admin_phone");
-  const result = { warned: 0, auto_approved: 0, reminded: 0 };
+  const result = { warned: 0, auto_approved: 0, reminded: 0, nudged: 0 };
 
   const active = db.prepare(`${SELECT_APPOINTMENTS} WHERE a.status != 'cancelled'`).all();
   for (const app of active) {
@@ -281,17 +319,34 @@ export function runDueJobs(db: DB, now = Date.now()) {
 
     if (app.status === "pending") {
       if (h <= deadline) {
-        // Q6: nobody approved in time → approved by default.
-        db.prepare("UPDATE appointments SET status = 'confirmed', approved_by = 'deadline' WHERE id = ?").run(app.id);
+        const barber = barberOf(db, app.barber_id);
+        const reach = barber?.phone ? `please text ${barber.name} directly at ${barber.phone}` : "please contact the shop";
+        if (app.premium) {
+          // Premium requests are never auto-approved: nudge the customer to contact the barber.
+          if (!app.customer_nudged_at && h > 0) {
+            queueSms(db, app.id, "text_your_barber", "customer", app.customer_phone,
+              `${SHOP}: ${app.barber_name} hasn't accepted your premium request for ${when(app)} yet — ${reach}.`);
+            db.prepare("UPDATE appointments SET customer_nudged_at = ? WHERE id = ?").run(new Date(now).toISOString(), app.id);
+            result.nudged++;
+          }
+          continue;
+        }
+        // Q6: nobody approved in time → approved by default, and the customer
+        // is asked to text the barber, who hasn't personally confirmed.
+        db.prepare("UPDATE appointments SET status = 'confirmed', approved_by = 'deadline', customer_nudged_at = ? WHERE id = ?")
+          .run(h > 0 ? new Date(now).toISOString() : null, app.id);
         result.auto_approved++;
         if (h > 0) {
-          queueSms(db, app.id, "confirmed", "customer", app.customer_phone,
-            `${SHOP}: Your appointment ${when(app)}${app.barber_name ? ` with ${app.barber_name}` : ""} is confirmed. See you soon!`);
+          queueSms(db, app.id, "text_your_barber", "customer", app.customer_phone,
+            `${SHOP}: Your appointment ${when(app)} with ${app.barber_name} is booked, but ${app.barber_name} hasn't confirmed personally — ${reach} to let them know you're coming.`);
+          result.nudged++;
         }
         continue;
       }
       if (h <= warnAt && !app.warning_sent_at) {
-        const body = `${SHOP}: ${app.customer_name}'s booking ${when(app)}${app.barber_name ? ` with ${app.barber_name}` : ""} still needs approval. It will be auto-approved ${deadline}h before.`;
+        const body = app.premium
+          ? `${SHOP}: ${app.customer_name}'s PREMIUM request ${when(app)}${app.barber_name ? ` with ${app.barber_name}` : ""} still needs approval. Premium requests are not auto-approved.`
+          : `${SHOP}: ${app.customer_name}'s booking ${when(app)}${app.barber_name ? ` with ${app.barber_name}` : ""} still needs approval. It will be auto-approved ${deadline}h before.`;
         queueSms(db, app.id, "approval_warning", "barber", barberOf(db, app.barber_id)?.phone, body);
         queueSms(db, app.id, "approval_warning", "admin", adminPhone, body);
         db.prepare("UPDATE appointments SET warning_sent_at = ? WHERE id = ?").run(new Date(now).toISOString(), app.id);
@@ -411,6 +466,143 @@ function requireBarberId(db: DB, value: unknown, message = "Please choose a barb
   return id;
 }
 
+// ---------------------------------------------------------------- availability
+
+const weekday = (date: string) => {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+};
+const addDays = (date: string, n: number) => {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+// Today's date in the shop's time zone.
+function shopToday(db: DB, now: number): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: setting(db, "timezone") }).format(new Date(now));
+}
+
+function scheduleOf(barber: any): WeeklySchedule {
+  if (!barber?.schedule) return DEFAULT_SCHEDULE;
+  try { return { ...DEFAULT_SCHEDULE, ...JSON.parse(barber.schedule) }; } catch { return DEFAULT_SCHEDULE; }
+}
+const maxDaysOf = (barber: any) => barber?.max_days_ahead ?? DEFAULT_MAX_DAYS_AHEAD;
+
+function onTimeOff(db: DB, barberId: number, date: string) {
+  return db.prepare("SELECT * FROM time_off WHERE barber_id = ? AND start_date <= ? AND end_date >= ?").get(barberId, date, date);
+}
+
+function isTaken(db: DB, barberId: number, date: string, time: string, exceptId: number | null = null) {
+  return !!db.prepare(
+    "SELECT 1 FROM appointments WHERE barber_id = ? AND date = ? AND time = ? AND status != 'cancelled' AND id != ?"
+  ).get(barberId, date, time, exceptId ?? -1);
+}
+
+// What kind of slot this is for the barber: 'normal' (within weekly hours),
+// 'premium' (outside them, inside the premium window, barber opted in), or
+// null with a reason.
+function slotKind(db: DB, barber: any, date: string, time: string): { kind: "normal" | "premium" | null; reason?: string } {
+  if (onTimeOff(db, barber.id, date)) return { kind: null, reason: `${barber.name} is off that day` };
+  const hours = scheduleOf(barber)[String(weekday(date))];
+  if (!hours) return { kind: null, reason: `${barber.name} doesn't work that day` };
+  if (time >= hours.start && time < hours.end) return { kind: "normal" };
+  if (barber.accepts_premium && time >= setting(db, "premium_start") && time < setting(db, "premium_end")) return { kind: "premium" };
+  return { kind: null, reason: `${barber.name} isn't available at that time` };
+}
+
+// Customer-facing slots for one barber on one date.
+export function getAvailability(db: DB, barberId: unknown, date: unknown, now = Date.now()) {
+  const barber = barberOf(db, Number(barberId));
+  if (!barber) throw new HttpError(404, "Barber not found");
+  if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "Please choose a valid date");
+  const today = shopToday(db, now);
+  const maxDate = addDays(today, maxDaysOf(barber));
+  const base: { date: string; max_date: string; premium_fee: string; slots: { time: string; kind: string }[]; message?: string } =
+    { date, max_date: maxDate, premium_fee: setting(db, "premium_fee"), slots: [] };
+  if (date < today) return { ...base, message: "That date has passed" };
+  if (date > maxDate) return { ...base, message: `${barber.name} takes bookings up to ${maxDaysOf(barber)} days ahead` };
+  const lead = num(db, "min_lead_hours");
+  let reason = "";
+  let anyWorking = false;
+  for (const time of TIME_SLOTS) {
+    const k = slotKind(db, barber, date, time);
+    if (!k.kind) { reason ||= k.reason ?? ""; continue; }
+    anyWorking = true;
+    if (hoursUntil(db, { date, time }, now) < lead || isTaken(db, barber.id, date, time)) continue;
+    base.slots.push({ time, kind: k.kind });
+  }
+  if (base.slots.length) return base;
+  return { ...base, message: anyWorking ? "No times left on this day" : reason };
+}
+
+// Weekly hours, booking horizon and premium opt-in. Barbers edit their own; admin edits anyone's.
+function requireOwnOrAdmin(user: SessionUser | null, barberId: number) {
+  const u = requireStaff(user);
+  if (u.role !== "admin" && u.barber_id !== barberId) throw new HttpError(403, "You can only change your own availability");
+  return u;
+}
+
+export function getBarberAvailability(db: DB, user: SessionUser | null, barberId: number) {
+  requireOwnOrAdmin(user, barberId);
+  const barber = barberOf(db, barberId);
+  if (!barber) throw new HttpError(404, "Barber not found");
+  return {
+    barber_id: barber.id,
+    schedule: scheduleOf(barber),
+    max_days_ahead: maxDaysOf(barber),
+    accepts_premium: !!barber.accepts_premium,
+    time_off: db.prepare("SELECT * FROM time_off WHERE barber_id = ? ORDER BY start_date").all(barberId),
+  };
+}
+
+export function updateBarberAvailability(db: DB, user: SessionUser | null, barberId: number, body: any) {
+  requireOwnOrAdmin(user, barberId);
+  const barber = barberOf(db, barberId);
+  if (!barber) throw new HttpError(404, "Barber not found");
+  let schedule = scheduleOf(barber);
+  if (body?.schedule !== undefined) {
+    const next: WeeklySchedule = {};
+    for (let d = 0; d < 7; d++) {
+      const h = body.schedule?.[String(d)];
+      if (h === null || h === undefined) { next[String(d)] = null; continue; }
+      if (!TIME_SLOTS.includes(h.start) || !(TIME_SLOTS.includes(h.end) || h.end === "21:00") || h.start >= h.end) {
+        throw new HttpError(400, "Working hours must start before they end, between 7 AM and 9 PM");
+      }
+      next[String(d)] = { start: h.start, end: h.end };
+    }
+    schedule = next;
+  }
+  let maxDays = maxDaysOf(barber);
+  if (body?.max_days_ahead !== undefined) {
+    maxDays = Number(body.max_days_ahead);
+    if (!Number.isInteger(maxDays) || maxDays < 1 || maxDays > 365) throw new HttpError(400, "Booking window must be 1–365 days");
+  }
+  const premium = body?.accepts_premium !== undefined ? (body.accepts_premium ? 1 : 0) : (barber.accepts_premium ? 1 : 0);
+  db.prepare("UPDATE barbers SET schedule = ?, max_days_ahead = ?, accepts_premium = ? WHERE id = ?")
+    .run(JSON.stringify(schedule), maxDays, premium, barberId);
+  return getBarberAvailability(db, user, barberId);
+}
+
+export function addTimeOff(db: DB, user: SessionUser | null, barberId: number, body: any) {
+  requireOwnOrAdmin(user, barberId);
+  if (!barberOf(db, barberId)) throw new HttpError(404, "Barber not found");
+  const valid = (d: unknown) => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d);
+  const start = body?.start_date, end = body?.end_date || body?.start_date;
+  if (!valid(start) || !valid(end) || end < start) throw new HttpError(400, "Choose a valid start and end date");
+  const note = typeof body?.note === "string" ? body.note.trim().slice(0, 100) : null;
+  db.prepare("INSERT INTO time_off (barber_id, start_date, end_date, note) VALUES (?, ?, ?, ?)").run(barberId, start, end, note);
+  // Existing bookings aren't cancelled automatically; tell staff how many clash.
+  const clashes = db.prepare(
+    "SELECT COUNT(*) AS n FROM appointments WHERE barber_id = ? AND status != 'cancelled' AND date >= ? AND date <= ?"
+  ).get(barberId, start, end).n;
+  return { ...getBarberAvailability(db, user, barberId), clashing_bookings: Number(clashes) };
+}
+
+export function removeTimeOff(db: DB, user: SessionUser | null, barberId: number, timeOffId: number) {
+  requireOwnOrAdmin(user, barberId);
+  db.prepare("DELETE FROM time_off WHERE id = ? AND barber_id = ?").run(timeOffId, barberId);
+  return getBarberAvailability(db, user, barberId);
+}
+
 // ---------------------------------------------------------------- appointments
 
 const SELECT_APPOINTMENTS = `
@@ -431,6 +623,9 @@ function publicView(db: DB, app: any, now: number) {
     barber_name: app.barber_name ?? null,
     can_cancel: app.status !== "cancelled" && h >= num(db, "cancel_cutoff_hours"),
     cancel_cutoff_hours: num(db, "cancel_cutoff_hours"),
+    premium: !!app.premium,
+    premium_fee: app.premium_fee ?? null,
+    barber_phone: barberOf(db, app.barber_id)?.phone ?? null,
     customer_confirmed: !!app.customer_confirmed_at,
     can_confirm_attendance: app.status !== "cancelled" && !app.customer_confirmed_at && h > 0 && h <= window,
     attendance_window_hours: window,
@@ -444,24 +639,40 @@ export function createAppointment(db: DB, body: any, now = Date.now()) {
   const customer_phone = cleanPhone(body?.customer_phone);
   const { date, time } = cleanDateTime(body?.date, body?.time);
   const barber_id = requireBarberId(db, body?.barber_id);
+  const barber = barberOf(db, barber_id);
 
   const lead = num(db, "min_lead_hours");
   if (hoursUntil(db, { date, time }, now) < lead) {
     throw new HttpError(400, `Bookings must be made at least ${lead} hour${lead === 1 ? "" : "s"} in advance`);
   }
+  if (date > addDays(shopToday(db, now), maxDaysOf(barber))) {
+    throw new HttpError(400, `${barber.name} takes bookings up to ${maxDaysOf(barber)} days ahead`);
+  }
+  const { kind, reason } = slotKind(db, barber, date, time);
+  if (!kind) throw new HttpError(400, reason!);
+  if (isTaken(db, barber_id, date, time)) throw new HttpError(409, "That time was just taken. Please pick another.");
+  const premium = kind === "premium";
+  const fee = setting(db, "premium_fee");
+  if (premium && body?.premium_ack !== true) {
+    throw new HttpError(400, `This is a premium time (+$${fee}). Please confirm you accept the premium fee.`);
+  }
 
-  const auto = setting(db, "approval_mode") === "auto";
+  // Premium requests always need the barber's approval.
+  const auto = setting(db, "approval_mode") === "auto" && !premium;
   const info = db.prepare(
-    "INSERT INTO appointments (customer_name, customer_phone, date, time, barber_id, status, ref, approved_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(customer_name, customer_phone, date, time, barber_id, auto ? "confirmed" : "pending", newRef(db), auto ? "auto" : null);
+    "INSERT INTO appointments (customer_name, customer_phone, date, time, barber_id, status, ref, approved_by, premium, premium_fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(customer_name, customer_phone, date, time, barber_id, auto ? "confirmed" : "pending", newRef(db), auto ? "auto" : null,
+    premium ? 1 : 0, premium ? fee : null);
   const app = getApp(db, Number(info.lastInsertRowid));
 
+  const contact = barberContact(db, barber_id);
+  const premiumNote = premium ? ` Premium request: +$${fee}, paid at the shop.` : "";
   queueSms(db, app.id, auto ? "confirmed" : "received", "customer", customer_phone, auto
-    ? `${SHOP}: You're booked ${when(app)} with ${app.barber_name}. Code ${app.ref}. Cancel online up to ${num(db, "cancel_cutoff_hours")}h before.`
-    : `${SHOP}: We got your request for ${when(app)} with ${app.barber_name}. We'll text you when it's confirmed. Code ${app.ref}.`);
+    ? `${SHOP}: You're booked ${when(app)} with ${app.barber_name}. Code ${app.ref}. Cancel online up to ${num(db, "cancel_cutoff_hours")}h before.${contact}`
+    : `${SHOP}: We got your ${premium ? "premium " : ""}request for ${when(app)} with ${app.barber_name}. We'll text you when it's confirmed. Code ${app.ref}.${premiumNote}${contact}`);
   if (!auto) {
-    queueSms(db, app.id, "new_request", "barber", barberOf(db, barber_id)?.phone,
-      `${SHOP}: New booking request from ${customer_name}, ${when(app)}. Please approve in the staff dashboard.`);
+    queueSms(db, app.id, "new_request", "barber", barber?.phone,
+      `${SHOP}: New ${premium ? `PREMIUM (+$${fee}) ` : ""}booking request from ${customer_name}, ${when(app)}. Please approve in the staff dashboard.`);
   }
   // A booking made inside the warning/deadline window is handled right away.
   runDueJobs(db, now);
@@ -551,7 +762,7 @@ export function updateAppointment(db: DB, user: SessionUser | null, id: number, 
   }
 
   let { customer_name, customer_phone, date, time, barber_id, status, cancelled_by, approved_by,
-    customer_confirmed_at, reminder_sent_at, warning_sent_at } = app;
+    customer_confirmed_at, reminder_sent_at, warning_sent_at, customer_nudged_at } = app;
 
   if (body?.customer_name !== undefined) customer_name = cleanText(body.customer_name, "Name");
   if (body?.customer_phone !== undefined) customer_phone = cleanPhone(body.customer_phone);
@@ -569,9 +780,15 @@ export function updateAppointment(db: DB, user: SessionUser | null, id: number, 
     if (app.status === "cancelled") throw new HttpError(400, "Cancelled bookings can't be moved");
     barber_id = requireBarberId(db, body.barber_id, "Choose a barber to move this booking to");
     // The receiving barber has to approve it.
-    if (setting(db, "approval_mode") === "auto") { status = "confirmed"; approved_by = "auto"; }
+    if (setting(db, "approval_mode") === "auto" && !app.premium) { status = "confirmed"; approved_by = "auto"; }
     else { status = "pending"; approved_by = null; }
     warning_sent_at = null;
+  }
+  if (moved || rescheduled) {
+    customer_nudged_at = null;
+    if (isTaken(db, barber_id, date, time, id)) {
+      throw new HttpError(409, `${barberOf(db, barber_id)?.name ?? "That barber"} already has a booking at that time`);
+    }
   }
 
   if (body?.status !== undefined && body.status !== app.status) {
@@ -587,10 +804,11 @@ export function updateAppointment(db: DB, user: SessionUser | null, id: number, 
   db.prepare(`
     UPDATE appointments
     SET customer_name = ?, customer_phone = ?, date = ?, time = ?, barber_id = ?, status = ?,
-        cancelled_by = ?, approved_by = ?, customer_confirmed_at = ?, reminder_sent_at = ?, warning_sent_at = ?
+        cancelled_by = ?, approved_by = ?, customer_confirmed_at = ?, reminder_sent_at = ?, warning_sent_at = ?,
+        customer_nudged_at = ?
     WHERE id = ?
   `).run(customer_name, customer_phone, date, time, barber_id, status, cancelled_by, approved_by,
-    customer_confirmed_at, reminder_sent_at, warning_sent_at, id);
+    customer_confirmed_at, reminder_sent_at, warning_sent_at, customer_nudged_at, id);
 
   // Text the customer (and the receiving barber) about what changed.
   const updated = getApp(db, id);
@@ -604,14 +822,14 @@ export function updateAppointment(db: DB, user: SessionUser | null, id: number, 
     if (rescheduled) parts.push(`moved to ${when(updated)}`);
     const tail = updated.status === "pending" ? " We'll text you once it's confirmed." : "";
     queueSms(db, id, moved ? "reassigned" : "rescheduled", "customer", phone,
-      `${SHOP}: Your appointment is ${parts.join(" and ")}.${tail} Code ${updated.ref}.`);
+      `${SHOP}: Your appointment is ${parts.join(" and ")}.${tail} Code ${updated.ref}.${barberContact(db, updated.barber_id)}`);
     if (moved && updated.status === "pending") {
       queueSms(db, id, "new_request", "barber", barberOf(db, barber_id)?.phone,
         `${SHOP}: ${updated.customer_name}'s booking ${when(updated)} was moved to you. Please approve it.`);
     }
   } else if (status === "confirmed" && app.status !== "confirmed") {
     queueSms(db, id, "confirmed", "customer", phone,
-      `${SHOP}: Your appointment ${when(updated)} with ${updated.barber_name} is confirmed. See you soon!`);
+      `${SHOP}: Your appointment ${when(updated)} with ${updated.barber_name} is confirmed. See you soon!${barberContact(db, updated.barber_id)}`);
   }
   runDueJobs(db, now);
 }
@@ -626,7 +844,10 @@ export function deleteAppointment(db: DB, user: SessionUser | null, id: number) 
 export function listBarbers(db: DB, user: SessionUser | null) {
   const rows = db.prepare("SELECT * FROM barbers ORDER BY name ASC").all();
   return rows.map((b: any) => {
-    const out: any = { id: b.id, name: b.name, specialty: b.specialty };
+    const out: any = {
+      id: b.id, name: b.name, specialty: b.specialty,
+      max_days_ahead: maxDaysOf(b), accepts_premium: !!b.accepts_premium,
+    };
     if (user?.role === "admin") { out.has_login = !!b.password_hash; out.phone = b.phone ?? null; }
     return out;
   });
@@ -680,6 +901,7 @@ export function deleteBarber(db: DB, user: SessionUser | null, id: number, body:
     else updateAppointment(db, admin, app.id, { status: "cancelled" }, now);
   }
   db.prepare("UPDATE appointments SET barber_id = NULL WHERE barber_id = ?").run(id);
+  db.prepare("DELETE FROM time_off WHERE barber_id = ?").run(id);
   db.prepare("DELETE FROM barbers WHERE id = ?").run(id);
   return { upcoming_affected: upcoming.length };
 }

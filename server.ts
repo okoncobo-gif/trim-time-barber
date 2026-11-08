@@ -109,6 +109,16 @@ async function startServer() {
   app.patch("/api/appointments/:id", handle(req => booking.updateAppointment(db, userOf(req), idOf(req), req.body)));
   app.delete("/api/appointments/:id", handle(req => booking.deleteAppointment(db, userOf(req), idOf(req))));
 
+  // Open slots for one barber on one date (customer booking form)
+  app.get("/api/availability", handle(req => booking.getAvailability(db, req.query.barber_id, req.query.date)));
+
+  // Barber availability (barber: own; admin: anyone)
+  app.get("/api/barbers/:id/availability", handle(req => booking.getBarberAvailability(db, userOf(req), idOf(req))));
+  app.put("/api/barbers/:id/availability", handle(req => booking.updateBarberAvailability(db, userOf(req), idOf(req), req.body)));
+  app.post("/api/barbers/:id/time-off", handle(req => booking.addTimeOff(db, userOf(req), idOf(req), req.body), 201));
+  app.delete("/api/barbers/:id/time-off/:timeOffId", handle(req =>
+    booking.removeTimeOff(db, userOf(req), idOf(req), Number(req.params.timeOffId))));
+
   // Barbers (list is public for the booking form; changes are admin-only)
   app.get("/api/barbers", handle(req => booking.listBarbers(db, userOf(req))));
   app.post("/api/barbers", handle(req => booking.createBarber(db, userOf(req), req.body), 201));
